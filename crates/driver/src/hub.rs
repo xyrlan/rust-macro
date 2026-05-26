@@ -221,4 +221,35 @@ mod tests {
             "expected Closed after hub drop, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn lagged_subscriber_gets_lagged_error_then_continues() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+        let mut rx = hub.subscribe().unwrap();
+
+        // Inject more events than the broadcast capacity (256). The subscriber
+        // never reads in between, so it should fall behind.
+        for _ in 0..(BROADCAST_CAPACITY as u32 + 50) {
+            drv.inject(RawEvent::KeyDown { key: KeyCode::A });
+        }
+        // Let the pump drain into the broadcast channel.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First recv should report the lag, not an event.
+        let first = rx.recv().await;
+        assert!(
+            matches!(first, Err(broadcast::error::RecvError::Lagged(_))),
+            "expected Lagged, got {first:?}"
+        );
+
+        // Subsequent recvs continue delivering buffered events (not Closed).
+        let next = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timed out");
+        assert!(
+            matches!(next, Ok(RawEvent::KeyDown { .. })),
+            "expected Ok event after Lagged, got {next:?}"
+        );
+    }
 }
