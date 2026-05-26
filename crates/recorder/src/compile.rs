@@ -1,0 +1,306 @@
+use std::time::{Duration, Instant};
+
+use rm_driver::RawEvent;
+use rm_macro_model::{Point, Step};
+
+/// One raw event paired with its capture timestamp.
+#[derive(Debug, Clone)]
+pub struct TimedEvent {
+    pub event: RawEvent,
+    pub at: Instant,
+}
+
+/// Compile a sequence of raw timed events into a high-level `Vec<Step>`:
+///   * **Adjacent** `KeyDown(k) → KeyUp(k)` (no events between) collapses into
+///     `KeyPress { key: k, hold_ms: delta }`. If anything (even another key)
+///     happens between, the events are kept as raw `KeyDown` / `KeyUp` — this
+///     is the honest representation for overlapping inputs.
+///   * Same rule for `MouseDown(b) → MouseUp(b)`.
+///   * `MouseMove` events become `Step::MouseMove { mode: Relative, to: dxdy }`.
+///   * `MouseWheel` becomes `Step::MouseScroll`.
+///   * Inter-event gaps become `Step::Wait { min_ms: gap, max_ms: gap }`.
+///   * Lone / orphan key/mouse-up events emit a literal `Step::KeyUp` etc.
+pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut last_at = raw[0].at;
+    while i < raw.len() {
+        let cur = &raw[i];
+        // Emit a Wait for the gap since the previously emitted step's end.
+        let gap = cur.at.duration_since(last_at);
+        if gap >= Duration::from_millis(1) {
+            let ms = gap.as_millis().min(u32::MAX as u128) as u32;
+            out.push(Step::Wait {
+                min_ms: ms,
+                max_ms: ms,
+            });
+        }
+        match cur.event {
+            RawEvent::KeyDown { key } => {
+                // Collapse to KeyPress ONLY if the immediately next event is
+                // the matching KeyUp. Otherwise emit a literal KeyDown — any
+                // overlap or interleaving stays honest in the step list.
+                if let Some(next) = raw.get(i + 1) {
+                    if let RawEvent::KeyUp { key: uk } = next.event {
+                        if uk == key {
+                            let hold = duration_ms_between(cur.at, next.at);
+                            out.push(Step::KeyPress { key, hold_ms: hold });
+                            last_at = next.at;
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                out.push(Step::KeyDown { key });
+            }
+            RawEvent::KeyUp { key } => {
+                out.push(Step::KeyUp { key });
+            }
+            RawEvent::MouseDown { button } => {
+                if let Some(next) = raw.get(i + 1) {
+                    if let RawEvent::MouseUp { button: ub } = next.event {
+                        if ub == button {
+                            let hold = duration_ms_between(cur.at, next.at);
+                            out.push(Step::MouseClick {
+                                button,
+                                hold_ms: hold,
+                                at: None,
+                            });
+                            last_at = next.at;
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                out.push(Step::MouseClick {
+                    button,
+                    hold_ms: 0,
+                    at: None,
+                });
+            }
+            RawEvent::MouseUp { .. } => {
+                // Orphan up — drop silently. (Always paired with the preceding
+                // MouseDown when adjacent; orphans imply caller noise.)
+            }
+            RawEvent::MouseMove { dx, dy } => {
+                out.push(Step::MouseMove {
+                    to: Point { x: dx, y: dy },
+                    mode: rm_macro_model::MoveMode::Relative,
+                });
+            }
+            RawEvent::MouseWheel { delta } => {
+                out.push(Step::MouseScroll { delta });
+            }
+        }
+        last_at = cur.at;
+        i += 1;
+    }
+    out
+}
+
+fn duration_ms_between(a: Instant, b: Instant) -> u32 {
+    b.saturating_duration_since(a)
+        .as_millis()
+        .min(u32::MAX as u128) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rm_macro_model::{KeyCode, MouseButton};
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    fn ev(at: Instant, e: RawEvent) -> TimedEvent {
+        TimedEvent { event: e, at }
+    }
+
+    #[test]
+    fn empty_returns_empty() {
+        assert!(compile_events(&[]).is_empty());
+    }
+
+    #[test]
+    fn keydown_keyup_collapses_to_keypress() {
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::KeyDown { key: KeyCode::W }),
+            ev(at(t0, 250), RawEvent::KeyUp { key: KeyCode::W }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::KeyPress {
+                key: KeyCode::W,
+                hold_ms: 250
+            }]
+        );
+    }
+
+    #[test]
+    fn gap_between_keys_emits_wait() {
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 80), RawEvent::KeyUp { key: KeyCode::A }),
+            ev(at(t0, 230), RawEvent::KeyDown { key: KeyCode::B }),
+            ev(at(t0, 310), RawEvent::KeyUp { key: KeyCode::B }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![
+                Step::KeyPress {
+                    key: KeyCode::A,
+                    hold_ms: 80
+                },
+                Step::Wait {
+                    min_ms: 150,
+                    max_ms: 150
+                },
+                Step::KeyPress {
+                    key: KeyCode::B,
+                    hold_ms: 80
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_keydown_without_keyup_emits_keydown() {
+        let t0 = Instant::now();
+        let raw = vec![ev(
+            at(t0, 0),
+            RawEvent::KeyDown {
+                key: KeyCode::LShift,
+            },
+        )];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::KeyDown {
+                key: KeyCode::LShift
+            }]
+        );
+    }
+
+    #[test]
+    fn mouse_down_up_collapses() {
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(
+                at(t0, 0),
+                RawEvent::MouseDown {
+                    button: MouseButton::Left,
+                },
+            ),
+            ev(
+                at(t0, 60),
+                RawEvent::MouseUp {
+                    button: MouseButton::Left,
+                },
+            ),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::MouseClick {
+                button: MouseButton::Left,
+                hold_ms: 60,
+                at: None
+            },]
+        );
+    }
+
+    #[test]
+    fn mouse_move_passes_through() {
+        let t0 = Instant::now();
+        let raw = vec![ev(at(t0, 0), RawEvent::MouseMove { dx: 10, dy: -5 })];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::MouseMove {
+                to: Point { x: 10, y: -5 },
+                mode: rm_macro_model::MoveMode::Relative
+            },]
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_passes_through() {
+        let t0 = Instant::now();
+        let raw = vec![ev(at(t0, 0), RawEvent::MouseWheel { delta: 120 })];
+        assert_eq!(compile_events(&raw), vec![Step::MouseScroll { delta: 120 }]);
+    }
+
+    #[test]
+    fn overlapping_keys_emit_raw_down_up() {
+        // Down A, Down B, Up A, Up B → no collapse, because A's KeyUp is not
+        // adjacent to A's KeyDown (B's KeyDown is between them). Honest
+        // representation: keep raw Down/Up + Wait gaps.
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 50), RawEvent::KeyDown { key: KeyCode::B }),
+            ev(at(t0, 100), RawEvent::KeyUp { key: KeyCode::A }),
+            ev(at(t0, 150), RawEvent::KeyUp { key: KeyCode::B }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![
+                Step::KeyDown { key: KeyCode::A },
+                Step::Wait {
+                    min_ms: 50,
+                    max_ms: 50
+                },
+                Step::KeyDown { key: KeyCode::B },
+                Step::Wait {
+                    min_ms: 50,
+                    max_ms: 50
+                },
+                Step::KeyUp { key: KeyCode::A },
+                Step::Wait {
+                    min_ms: 50,
+                    max_ms: 50
+                },
+                Step::KeyUp { key: KeyCode::B },
+            ]
+        );
+    }
+
+    #[test]
+    fn non_overlapping_keys_collapse_to_keypress() {
+        // Down A, Up A, Down B, Up B → both collapse cleanly.
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 100), RawEvent::KeyUp { key: KeyCode::A }),
+            ev(at(t0, 200), RawEvent::KeyDown { key: KeyCode::B }),
+            ev(at(t0, 300), RawEvent::KeyUp { key: KeyCode::B }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![
+                Step::KeyPress {
+                    key: KeyCode::A,
+                    hold_ms: 100
+                },
+                Step::Wait {
+                    min_ms: 100,
+                    max_ms: 100
+                },
+                Step::KeyPress {
+                    key: KeyCode::B,
+                    hold_ms: 100
+                },
+            ]
+        );
+    }
+}
