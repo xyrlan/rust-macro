@@ -158,7 +158,11 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -169,6 +173,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 ```
+
+Plan 1 is fully cross-platform (no Interception calls yet) — keeping Ubuntu in the matrix catches portability bugs cheaply. Plan 2 will need to scope its Interception-specific tests to Windows.
 
 - [ ] **Step 6: Verify workspace builds**
 
@@ -402,7 +408,7 @@ pub enum MouseButton {
     X2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Modifier {
     Ctrl,
@@ -874,15 +880,6 @@ impl MockDriver {
         let _ = self.inject_tx.send(event);
     }
 
-    /// Close the driver. Pending and future `recv()` calls will see `Closed`.
-    pub fn close(&self) {
-        // Dropping all senders closes the channel. We don't have access to drop
-        // them all here without splitting types, so emulate close by simply not
-        // injecting further. For tests that need a deterministic close, drop the
-        // MockDriver itself.
-        // (No-op left as documentation.)
-    }
-
     /// Returns everything that was sent via `Driver::send`, draining the buffer.
     pub fn drain_sent(&self) -> Vec<RawEvent> {
         std::mem::take(&mut self.sent.lock().unwrap())
@@ -1217,7 +1214,7 @@ Create `crates/recorder/src/compile.rs`:
 use std::time::{Duration, Instant};
 
 use rm_driver::RawEvent;
-use rm_macro_model::{KeyCode, MouseButton, Point, Step};
+use rm_macro_model::{Point, Step};
 
 /// One raw event paired with its capture timestamp.
 #[derive(Debug, Clone)]
@@ -1227,14 +1224,15 @@ pub struct TimedEvent {
 }
 
 /// Compile a sequence of raw timed events into a high-level `Vec<Step>`:
-///   * `KeyDown(k) → KeyUp(k)` within a single recording collapses into
-///     `KeyPress { key: k, hold_ms: delta }`.
-///   * `MouseDown(b) → MouseUp(b)` collapses into `MouseClick { hold_ms: delta }`.
+///   * **Adjacent** `KeyDown(k) → KeyUp(k)` (no events between) collapses into
+///     `KeyPress { key: k, hold_ms: delta }`. If anything (even another key)
+///     happens between, the events are kept as raw `KeyDown` / `KeyUp` — this
+///     is the honest representation for overlapping inputs.
+///   * Same rule for `MouseDown(b) → MouseUp(b)`.
 ///   * `MouseMove` events become `Step::MouseMove { mode: Relative, to: dxdy }`.
 ///   * `MouseWheel` becomes `Step::MouseScroll`.
 ///   * Inter-event gaps become `Step::Wait { min_ms: gap, max_ms: gap }`.
-///   * Trailing key/mouse that never went up emits a `Step::KeyDown` /
-///     `Step::*` lone variant. (Caller decides how to surface this.)
+///   * Lone / orphan key/mouse-up events emit a literal `Step::KeyUp` etc.
 pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
     if raw.is_empty() { return Vec::new(); }
     let mut out = Vec::new();
@@ -1242,7 +1240,7 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
     let mut last_at = raw[0].at;
     while i < raw.len() {
         let cur = &raw[i];
-        // Emit a Wait for the gap since previous emitted step's wall-clock end.
+        // Emit a Wait for the gap since the previously emitted step's end.
         let gap = cur.at.duration_since(last_at);
         if gap >= Duration::from_millis(1) {
             let ms = gap.as_millis().min(u32::MAX as u128) as u32;
@@ -1250,34 +1248,42 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
         }
         match cur.event {
             RawEvent::KeyDown { key } => {
-                // Look ahead for matching KeyUp.
-                if let Some(j) = find_matching_key_up(raw, i + 1, key) {
-                    let hold = duration_ms_between(cur.at, raw[j].at);
-                    out.push(Step::KeyPress { key, hold_ms: hold });
-                    last_at = raw[j].at;
-                    i = j + 1;
-                    continue;
-                } else {
-                    out.push(Step::KeyDown { key });
+                // Collapse to KeyPress ONLY if the immediately next event is
+                // the matching KeyUp. Otherwise emit a literal KeyDown — any
+                // overlap or interleaving stays honest in the step list.
+                if let Some(next) = raw.get(i + 1) {
+                    if let RawEvent::KeyUp { key: uk } = next.event {
+                        if uk == key {
+                            let hold = duration_ms_between(cur.at, next.at);
+                            out.push(Step::KeyPress { key, hold_ms: hold });
+                            last_at = next.at;
+                            i += 2;
+                            continue;
+                        }
+                    }
                 }
+                out.push(Step::KeyDown { key });
             }
             RawEvent::KeyUp { key } => {
-                // Lone KeyUp without a prior KeyDown — emit as-is.
                 out.push(Step::KeyUp { key });
             }
             RawEvent::MouseDown { button } => {
-                if let Some(j) = find_matching_mouse_up(raw, i + 1, button) {
-                    let hold = duration_ms_between(cur.at, raw[j].at);
-                    out.push(Step::MouseClick { button, hold_ms: hold, at: None });
-                    last_at = raw[j].at;
-                    i = j + 1;
-                    continue;
-                } else {
-                    out.push(Step::MouseClick { button, hold_ms: 0, at: None });
+                if let Some(next) = raw.get(i + 1) {
+                    if let RawEvent::MouseUp { button: ub } = next.event {
+                        if ub == button {
+                            let hold = duration_ms_between(cur.at, next.at);
+                            out.push(Step::MouseClick { button, hold_ms: hold, at: None });
+                            last_at = next.at;
+                            i += 2;
+                            continue;
+                        }
+                    }
                 }
+                out.push(Step::MouseClick { button, hold_ms: 0, at: None });
             }
             RawEvent::MouseUp { .. } => {
-                // Orphan up — drop silently. (Compile contract: caller pairs them.)
+                // Orphan up — drop silently. (Always paired with the preceding
+                // MouseDown when adjacent; orphans imply caller noise.)
             }
             RawEvent::MouseMove { dx, dy } => {
                 out.push(Step::MouseMove {
@@ -1293,16 +1299,6 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
         i += 1;
     }
     out
-}
-
-fn find_matching_key_up(raw: &[TimedEvent], from: usize, key: KeyCode) -> Option<usize> {
-    raw[from..].iter().position(|e| matches!(e.event, RawEvent::KeyUp { key: k } if k == key))
-        .map(|p| p + from)
-}
-
-fn find_matching_mouse_up(raw: &[TimedEvent], from: usize, button: MouseButton) -> Option<usize> {
-    raw[from..].iter().position(|e| matches!(e.event, RawEvent::MouseUp { button: b } if b == button))
-        .map(|p| p + from)
 }
 
 fn duration_ms_between(a: Instant, b: Instant) -> u32 {
@@ -1394,8 +1390,10 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_keys_pair_correctly() {
-        // Down A, Down B, Up A, Up B → A pairs with the *first* matching up.
+    fn overlapping_keys_emit_raw_down_up() {
+        // Down A, Down B, Up A, Up B → no collapse, because A's KeyUp is not
+        // adjacent to A's KeyDown (B's KeyDown is between them). Honest
+        // representation: keep raw Down/Up + Wait gaps.
         let t0 = Instant::now();
         let raw = vec![
             ev(at(t0, 0),   RawEvent::KeyDown { key: KeyCode::A }),
@@ -1404,12 +1402,31 @@ mod tests {
             ev(at(t0, 150), RawEvent::KeyUp   { key: KeyCode::B }),
         ];
         let steps = compile_events(&raw);
-        // A press goes 0→100 (hold 100); after the A pair, last_at jumps to t0+100.
-        // Then we see KeyDown B at t0+50. Gap is negative (saturates to 0), so no Wait.
-        // B keypress runs 50→150 (hold 100). But last_at was 100 when we started B,
-        // so the gap from 100→50 saturates to 0 (no Wait emitted).
+        assert_eq!(steps, vec![
+            Step::KeyDown { key: KeyCode::A },
+            Step::Wait { min_ms: 50, max_ms: 50 },
+            Step::KeyDown { key: KeyCode::B },
+            Step::Wait { min_ms: 50, max_ms: 50 },
+            Step::KeyUp   { key: KeyCode::A },
+            Step::Wait { min_ms: 50, max_ms: 50 },
+            Step::KeyUp   { key: KeyCode::B },
+        ]);
+    }
+
+    #[test]
+    fn non_overlapping_keys_collapse_to_keypress() {
+        // Down A, Up A, Down B, Up B → both collapse cleanly.
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0),   RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 100), RawEvent::KeyUp   { key: KeyCode::A }),
+            ev(at(t0, 200), RawEvent::KeyDown { key: KeyCode::B }),
+            ev(at(t0, 300), RawEvent::KeyUp   { key: KeyCode::B }),
+        ];
+        let steps = compile_events(&raw);
         assert_eq!(steps, vec![
             Step::KeyPress { key: KeyCode::A, hold_ms: 100 },
+            Step::Wait { min_ms: 100, max_ms: 100 },
             Step::KeyPress { key: KeyCode::B, hold_ms: 100 },
         ]);
     }
@@ -1419,7 +1436,7 @@ mod tests {
 - [ ] **Step 3: Run tests**
 
 Run: `cargo test -p rm-recorder`
-Expected: 8 tests pass.
+Expected: 9 tests pass.
 
 - [ ] **Step 4: Commit**
 
@@ -1452,19 +1469,21 @@ use rm_macro_model::Step;
 use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
 
-/// Handle to a running recording. Drop to cancel; `finish().await` to
-/// gracefully stop and retrieve the compiled steps.
+/// Handle to a running recording. Two ways to end:
+///   * `finish().await` — sends an explicit stop signal, then awaits.
+///   * `wait_for_close().await` — does NOT send stop; awaits until the driver
+///     itself closes (e.g. stdin EOF). Use this when the caller knows the
+///     event source has finite input.
+///
+/// Dropping the handle without calling either also cancels the task (drops
+/// the stop sender, which fires the stop branch of the recorder's `select!`).
 pub struct RecordingHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<Vec<TimedEvent>>,
-    /// Whether the recorder should re-emit captured events back to the driver
-    /// during recording (passthrough). True is what the production app uses;
-    /// tests typically set this false.
-    pub passthrough: bool,
 }
 
 impl RecordingHandle {
-    /// Stop the recording, await the task, and return the compiled steps.
+    /// Send a stop signal and await the recorder task.
     pub async fn finish(mut self) -> Result<Vec<Step>> {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
@@ -1474,11 +1493,32 @@ impl RecordingHandle {
         })?;
         Ok(compile_events(&raw))
     }
+
+    /// Await the recorder task without sending a stop signal — the task will
+    /// exit on its own when the driver returns `DriverError::Closed`. The
+    /// `stop_tx` is held alive until this future resolves (so the recorder's
+    /// `select!` won't see a phantom stop while we're waiting).
+    pub async fn wait_for_close(self) -> Result<Vec<Step>> {
+        let raw = self.join.await.map_err(|e| {
+            rm_error::AppError::Other(format!("recorder task panicked: {e}"))
+        })?;
+        // self.stop_tx drops here, after the task is already complete — no effect.
+        Ok(compile_events(&raw))
+    }
 }
 
-/// Start a recording. Reads from `driver.recv()` until a stop signal is sent
-/// via `finish()`. If `passthrough` is true, each captured event is re-emitted
-/// via `driver.send()` so the OS still sees the input.
+/// Start a recording. Reads events from `driver.recv()` in a loop and
+/// timestamps each one. When `passthrough` is true, each captured event is
+/// re-emitted via `driver.send()` so the OS still sees it (this is the
+/// production behavior — see the spec).
+///
+/// The loop exits when either: (a) `driver.recv()` returns `Closed` (or any
+/// other error), or (b) the stop signal fires (from `finish()` or from the
+/// handle being dropped).
+///
+/// The `select!` is `biased` so that pending driver events are always
+/// processed before checking the stop signal — this guarantees that a final
+/// burst of events is captured before a manual `finish()` short-circuits.
 pub fn start_recording(
     driver: Arc<dyn Driver>,
     passthrough: bool,
@@ -1489,10 +1529,7 @@ pub fn start_recording(
     let join = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = &mut stop_rx => {
-                    debug!("recorder: stop signal received");
-                    break;
-                }
+                biased;
                 got = driver.recv() => match got {
                     Ok(event) => {
                         let at = Instant::now();
@@ -1512,12 +1549,16 @@ pub fn start_recording(
                         break;
                     }
                 }
+                _ = &mut stop_rx => {
+                    debug!("recorder: stop signal received");
+                    break;
+                }
             }
         }
         // Drain the buffer.
         std::mem::take(&mut *buf_task.lock().await)
     });
-    RecordingHandle { stop_tx: Some(stop_tx), join, passthrough }
+    RecordingHandle { stop_tx: Some(stop_tx), join }
 }
 
 #[cfg(test)]
@@ -1568,13 +1609,33 @@ mod tests {
         assert_eq!(sent[0], RawEvent::KeyDown { key: KeyCode::B });
         assert_eq!(sent[1], RawEvent::KeyUp { key: KeyCode::B });
     }
+
+    #[tokio::test]
+    async fn wait_for_close_resolves_when_driver_closes() {
+        // A driver that returns Closed immediately on recv. We simulate this
+        // by injecting nothing and dropping the inject sender via close-of-clone.
+        struct AlwaysClosed;
+        #[async_trait::async_trait]
+        impl rm_driver::Driver for AlwaysClosed {
+            async fn send(&self, _e: rm_driver::RawEvent)
+                -> std::result::Result<(), rm_driver::DriverError> { Ok(()) }
+            async fn recv(&self)
+                -> std::result::Result<rm_driver::RawEvent, rm_driver::DriverError> {
+                Err(rm_driver::DriverError::Closed)
+            }
+        }
+        let drv: Arc<dyn rm_driver::Driver> = Arc::new(AlwaysClosed);
+        let h = start_recording(drv, false);
+        let steps = h.wait_for_close().await.unwrap();
+        assert!(steps.is_empty());
+    }
 }
 ```
 
 - [ ] **Step 2: Run tests**
 
 Run: `cargo test -p rm-recorder`
-Expected: 8 (compile) + 2 (task) = 10 tests pass.
+Expected: 9 (compile) + 3 (task) = 12 tests pass.
 
 - [ ] **Step 3: Commit**
 
@@ -1919,8 +1980,13 @@ struct RegistryInner {
 impl HotkeyRegistry {
     pub fn new() -> Self { Self::default() }
 
-    /// Register or replace the hotkey for a macro.
-    pub async fn bind(&self, id: Uuid, trigger: Trigger) {
+    /// Register or replace the hotkey for a macro. Modifier lists are
+    /// normalized (sorted + deduplicated) before storage so order and
+    /// duplicates in the input don't affect matching.
+    pub async fn bind(&self, id: Uuid, mut trigger: Trigger) {
+        let Trigger::Hotkey { ref mut modifiers, .. } = trigger;
+        modifiers.sort();
+        modifiers.dedup();
         self.inner.lock().await.by_id.insert(id, trigger);
     }
 
@@ -2113,6 +2179,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+dirs = "5"
 rm-driver = { path = "../driver" }
 rm-error = { path = "../error" }
 rm-hotkey = { path = "../hotkey" }
@@ -2195,24 +2262,17 @@ use rm_error::{AppError, Result};
 use rm_macro_model::{KeyCode, Macro, Modifier, PlaybackMode, Trigger};
 use rm_player::play;
 use rm_recorder::start_recording;
-use rm_storage::{delete_macro, load_all, load_macro, save_macro};
-use uuid::Uuid;
+use rm_storage::{delete_macro, load_all, save_macro};
 
 use crate::stdio_driver::StdioDriver;
 
-/// Record from stdin (JSONL of RawEvent), stop on EOF, save under `name`.
+/// Record from stdin (JSONL of RawEvent). The recorder exits naturally when
+/// stdin EOFs (the StdioDriver returns `DriverError::Closed`), so this just
+/// awaits the task without ever sending a stop signal.
 pub async fn cmd_record(root: &Path, name: &str) -> Result<()> {
     let drv: Arc<dyn Driver> = Arc::new(StdioDriver::new());
     let handle = start_recording(drv, false);
-    // The recorder loop will exit on Driver::Closed when stdin EOFs.
-    // We just need to await the join handle by issuing finish() after a short
-    // delay — but `start_recording` doesn't return until `finish()` is called.
-    // So we drop into a small loop: poll status by checking stdin closure
-    // indirectly via timeout — simpler: spawn a parallel task that signals stop
-    // when stdin is drained. Easiest model: race a timer with finish().
-    // For Plan 1 we accept a 200ms idle window after the first event as "done".
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let steps = handle.finish().await?;
+    let steps = handle.wait_for_close().await?;
     if steps.is_empty() {
         return Err(AppError::Other("no events recorded".into()));
     }
@@ -2229,8 +2289,15 @@ pub async fn cmd_record(root: &Path, name: &str) -> Result<()> {
 
 pub async fn cmd_play(root: &Path, name: &str) -> Result<()> {
     let macros = load_all(root)?;
-    let m = macros.into_iter().find(|m| m.name == name)
+    let mut m = macros.into_iter().find(|m| m.name == name)
         .ok_or_else(|| AppError::MacroNotFound(name.into()))?;
+    // The CLI demo has no stop-hotkey or signal handler, so unbounded modes
+    // would block the terminal forever. Override to Once with a note.
+    if matches!(m.playback, PlaybackMode::Loop | PlaybackMode::Toggle) {
+        eprintln!("note: macro playback is {:?}; CLI overrides to Once \
+                   (no stop signal available)", m.playback);
+        m.playback = PlaybackMode::Once;
+    }
     let drv: Arc<dyn Driver> = Arc::new(StdioDriver::new());
     play(drv, m).wait().await
 }
@@ -2249,12 +2316,6 @@ pub fn cmd_delete(root: &Path, name: &str) -> Result<()> {
     delete_macro(root, id)?;
     println!("deleted {name}");
     Ok(())
-}
-
-/// Helper for the e2e test (Task 13).
-pub async fn cmd_play_by_id(root: &Path, id: Uuid, driver: Arc<dyn Driver>) -> Result<()> {
-    let m = load_macro(root, id)?;
-    play(driver, m).wait().await
 }
 ```
 
@@ -2275,7 +2336,8 @@ mod stdio_driver;
 #[derive(Parser)]
 #[command(name = "macro-cli", version)]
 struct Cli {
-    /// Storage root (defaults to ./.rust-macro).
+    /// Storage root. Defaults to `<data_dir>/rust-macro` (e.g. on Windows,
+    /// `%APPDATA%/rust-macro`). Matches what the Tauri app will use in Plan 3.
     #[arg(long, global = true)]
     root: Option<PathBuf>,
 
@@ -2303,7 +2365,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let root = cli.root.unwrap_or_else(|| PathBuf::from("./.rust-macro"));
+    let root = cli.root.unwrap_or_else(|| {
+        dirs::data_dir()
+            .map(|d| d.join("rust-macro"))
+            .unwrap_or_else(|| PathBuf::from("./.rust-macro"))
+    });
 
     let res: Result<()> = match cli.cmd {
         Cmd::Record { name } => commands::cmd_record(&root, &name).await,
@@ -2413,7 +2479,7 @@ Expected: 1 test pass.
 - [ ] **Step 3: Run the full test suite as a sanity check**
 
 Run: `cargo test --workspace`
-Expected: every crate's tests pass. ~35 tests total.
+Expected: every crate's tests pass. ~50 tests total (rm-error 4, rm-macro-model 13, rm-driver 7, rm-storage 6, rm-recorder 12, rm-player 6, rm-hotkey 3, rm-cli e2e 1).
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
@@ -2499,9 +2565,15 @@ MIT OR Apache-2.0
 ```markdown
 # rust-macro — Plan 2: Real Interception Driver (stub)
 
-**Goal:** Swap `MockDriver` (Plan 1) for an `InterceptionDriver` backed by the real Interception kernel driver via the `interception-rs` crate. Add driver-status detection and the bundled installer flow.
+**Goal:** Swap `MockDriver` (Plan 1) for an `InterceptionDriver` backed by the real Interception kernel driver via the `interception-rs` crate. Add driver-status detection, the bundled installer flow, and a driver multiplexer ("DriverHub") so multiple consumers (recorder, hotkey listener, player) can share one underlying device source.
 
 **Architecture:** New crate `rm-driver-interception` providing `InterceptionDriver: Driver`. Add `driver::detect_status()` returning `{ NotInstalled, InstalledNotRunning, Running }`. `rm-cli` grows a `driver` subcommand: `status`, `install`.
+
+**Required design work — DriverHub:** Plan 1 leaves a single-consumer assumption (only one of recorder / hotkey / player calls `driver.recv()` at a time, because the CLI is sequential). The real app (Plan 3) needs all three concurrently. Plan 2 must introduce a `DriverHub` that owns the single `Driver` impl and exposes:
+  * `subscribe() -> mpsc::Receiver<RawEvent>` for fan-out reads;
+  * `send(event)` for direct emission;
+  * a single internal task that polls `driver.recv()` and broadcasts to all subscribers.
+Existing `recorder`, `hotkey`, `player` are refactored to accept a `DriverHub` handle instead of `Arc<dyn Driver>`.
 
 **Tech Stack:** Adds `interception-rs` (or a thin FFI binding to `interception.dll` if the crate isn't suitable on current Rust). Bundles the upstream Interception installer (`install-interception.exe`).
 
@@ -2548,8 +2620,6 @@ Expected: all clean. Plan 1 complete.
 
 ## Self-Review
 
-(Run mentally after writing the plan; fix any issues inline before sharing.)
-
 **Spec coverage:** All goals from the spec for the *backend* are covered:
 - Macro/Step/Trigger/PlaybackMode types — Task 4
 - Step-by-step editing data model — Tasks 3-4 (Step variants)
@@ -2563,6 +2633,7 @@ Expected: all clean. Plan 1 complete.
 Out-of-scope for Plan 1 (handed off to Plans 2/3):
 - Real Interception driver — Plan 2
 - Driver install flow — Plan 2
+- Multi-consumer driver fan-out (`DriverHub`) — Plan 2 (single consumer assumed here; CLI is sequential)
 - Tauri GUI — Plan 3
 - Stop hotkey global state — surfaces in Plan 3 (the app crate) since v1 spec says it lives at the app boundary
 - Recording-overlay UX — Plan 3
@@ -2571,14 +2642,22 @@ Out-of-scope for Plan 1 (handed off to Plans 2/3):
 
 **Type consistency:**
 - `KeyCode`, `MouseButton`, `Modifier`, `Point` defined Task 3, used consistently in Tasks 4, 5, 8, 10, 11.
+- `Modifier` is `Ord`-derived in Task 3 to support deduplication in Task 11 (`bind`).
 - `RawEvent` defined Task 5, used in Tasks 6, 8, 9, 10, 11, 12, 13.
-- `Driver` trait defined Task 5, impl by `MockDriver` (Task 6), `StdioDriver` (Task 12). All async, all `Send + Sync`.
+- `Driver` trait defined Task 5, impl by `MockDriver` (Task 6), `StdioDriver` (Task 12), plus an inline `AlwaysClosed` test fixture in Task 9. All async, all `Send + Sync`.
 - `Step` defined Task 4, produced by Task 8 (compile), consumed by Task 10 (player).
+- `RecordingHandle` (Task 9) exposes both `finish()` (manual stop) and `wait_for_close()` (await natural driver close). `cmd_record` (Task 12) uses the latter; tests use the former.
 - Crate names: `rm-error`, `rm-macro-model`, `rm-driver`, `rm-storage`, `rm-recorder`, `rm-player`, `rm-hotkey`, `rm-cli`. Consistent everywhere.
 
+**Known limitations carried into Plan 1 (documented, not bugs):**
+- Compile algorithm only collapses `KeyDown → KeyUp` pairs when they are **adjacent** in the event stream. Overlapping presses (`Down A, Down B, Up A, Up B`) keep raw Down/Up steps — honest but the editor in Plan 3 needs to render those well.
+- CLI `play` overrides `Loop` and `Toggle` to `Once` because there is no stop signal available in the terminal demo.
+- Storage uses atomic write-then-rename, but two concurrent processes saving the same macro can race — the v1 app is single-process, so this is acceptable.
+
 **Acceptance criteria for Plan 1:**
-- `cargo test --workspace` passes (≥ ~35 tests).
+- `cargo test --workspace` passes (~50 tests: rm-error 4, rm-macro-model 13, rm-driver 7, rm-storage 6, rm-recorder 12, rm-player 6, rm-hotkey 3, rm-cli e2e 1).
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo fmt --all -- --check` clean.
+- CI matrix passes on both `windows-latest` and `ubuntu-latest`.
 - `macro-cli list/record/play/delete` exercised end-to-end via JSONL on stdio.
 - Integration test in `crates/cli/tests/e2e.rs` proves the full record→save→load→play data path.
