@@ -4,17 +4,17 @@ pub use compile::{compile_events, TimedEvent};
 use std::sync::Arc;
 use std::time::Instant;
 
-use rm_driver::Driver;
+use rm_driver::DriverHub;
 use rm_error::Result;
 use rm_macro_model::Step;
-use tokio::sync::{oneshot, Mutex};
-use tracing::debug;
+use tokio::sync::{broadcast, oneshot, Mutex};
+use tracing::{debug, warn};
 
 /// Handle to a running recording. Two ways to end:
 ///   * `finish().await` — sends an explicit stop signal, then awaits.
-///   * `wait_for_close().await` — does NOT send stop; awaits until the driver
-///     itself closes (e.g. stdin EOF). Use this when the caller knows the
-///     event source has finite input.
+///   * `wait_for_close().await` — does NOT send stop; awaits until the hub
+///     itself shuts down (driver closed or hub dropped). Use this when the
+///     caller knows the event source has finite input.
 ///
 /// Dropping the handle without calling either also cancels the task (drops
 /// the stop sender, which fires the stop branch of the recorder's `select!`).
@@ -37,9 +37,7 @@ impl RecordingHandle {
     }
 
     /// Await the recorder task without sending a stop signal — the task will
-    /// exit on its own when the driver returns `DriverError::Closed`. The
-    /// `stop_tx` is held alive until this future resolves (so the recorder's
-    /// `select!` won't see a phantom stop while we're waiting).
+    /// exit on its own when the hub shuts down (driver closes or hub drops).
     pub async fn wait_for_close(self) -> Result<Vec<Step>> {
         let raw = self
             .join
@@ -50,42 +48,45 @@ impl RecordingHandle {
     }
 }
 
-/// Start a recording. Reads events from `driver.recv()` in a loop and
+/// Start a recording. Reads events from the hub's broadcast stream and
 /// timestamps each one. When `passthrough` is true, each captured event is
-/// re-emitted via `driver.send()` so the OS still sees it (this is the
-/// production behavior — see the spec).
+/// re-emitted via `hub.send()` so the OS still sees it (production behavior).
 ///
-/// The loop exits when either: (a) `driver.recv()` returns `Closed` (or any
-/// other error), or (b) the stop signal fires (from `finish()` or from the
-/// handle being dropped).
+/// **Important**: `hub.subscribe()` is called synchronously on the caller's
+/// thread before spawning, per the DriverHub API invariant. If the hub is
+/// already shut down, the task exits immediately with an empty buffer.
 ///
-/// The `select!` is `biased` so that pending driver events are always
-/// processed before checking the stop signal — this guarantees that a final
-/// burst of events is captured before a manual `finish()` short-circuits.
-pub fn start_recording(driver: Arc<dyn Driver>, passthrough: bool) -> RecordingHandle {
+/// The `select!` is `biased` so that pending events are processed before
+/// checking the stop signal — this guarantees a final burst is captured
+/// before a manual `finish()` short-circuits.
+pub fn start_recording(hub: Arc<DriverHub>, passthrough: bool) -> RecordingHandle {
+    let rx = hub.subscribe();
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let buf: Arc<Mutex<Vec<TimedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let buf_task = buf.clone();
     let join = tokio::spawn(async move {
+        let mut rx = match rx {
+            Some(rx) => rx,
+            None => return Vec::new(),
+        };
         loop {
             tokio::select! {
                 biased;
-                got = driver.recv() => match got {
+                got = rx.recv() => match got {
                     Ok(event) => {
                         let at = Instant::now();
                         if passthrough {
-                            if let Err(e) = driver.send(event).await {
+                            if let Err(e) = hub.send(event).await {
                                 debug!(error = ?e, "recorder: passthrough send failed");
                             }
                         }
                         buf_task.lock().await.push(TimedEvent { event, at });
                     }
-                    Err(rm_driver::DriverError::Closed) => {
-                        debug!("recorder: driver closed");
-                        break;
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "recorder: dropped events under load");
                     }
-                    Err(e) => {
-                        debug!(error = ?e, "recorder: driver recv error, stopping");
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("recorder: hub closed");
                         break;
                     }
                 },
@@ -95,7 +96,6 @@ pub fn start_recording(driver: Arc<dyn Driver>, passthrough: bool) -> RecordingH
                 }
             }
         }
-        // Drain the buffer.
         std::mem::take(&mut *buf_task.lock().await)
     });
     RecordingHandle {
@@ -108,23 +108,21 @@ pub fn start_recording(driver: Arc<dyn Driver>, passthrough: bool) -> RecordingH
 mod tests {
     use super::*;
     use rm_driver::mock::MockDriver;
-    use rm_driver::RawEvent;
+    use rm_driver::{Driver, DriverError, RawEvent};
     use rm_macro_model::{KeyCode, Step};
 
     #[tokio::test]
     async fn records_injected_events_no_passthrough() {
         let drv = Arc::new(MockDriver::new());
-        let h = start_recording(drv.clone(), false);
+        let hub = DriverHub::start(drv.clone());
+        let h = start_recording(hub, false);
 
         drv.inject(RawEvent::KeyDown { key: KeyCode::A });
-        // Small sleep so timestamps differ.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drv.inject(RawEvent::KeyUp { key: KeyCode::A });
-        // Give the task a tick to drain the inject channel before stop.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let steps = h.finish().await.unwrap();
-        // Expect: KeyPress with non-zero hold.
         assert_eq!(steps.len(), 1);
         match &steps[0] {
             Step::KeyPress { key, hold_ms } => {
@@ -140,7 +138,8 @@ mod tests {
     #[tokio::test]
     async fn passthrough_re_emits_events() {
         let drv = Arc::new(MockDriver::new());
-        let h = start_recording(drv.clone(), true);
+        let hub = DriverHub::start(drv.clone());
+        let h = start_recording(hub, true);
 
         drv.inject(RawEvent::KeyDown { key: KeyCode::B });
         drv.inject(RawEvent::KeyUp { key: KeyCode::B });
@@ -155,25 +154,23 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_close_resolves_when_driver_closes() {
-        // A driver that returns Closed immediately on recv. We simulate this
-        // by injecting nothing and dropping the inject sender via close-of-clone.
+        // Driver that returns Closed immediately on recv. With the hub in
+        // between, the pump sees Closed, drops the Sender, and the recorder's
+        // subscribe Receiver resolves to Err(Closed) — same observable
+        // behavior as Plan 1's direct-driver path.
         struct AlwaysClosed;
         #[async_trait::async_trait]
-        impl rm_driver::Driver for AlwaysClosed {
-            async fn send(
-                &self,
-                _e: rm_driver::RawEvent,
-            ) -> std::result::Result<(), rm_driver::DriverError> {
+        impl Driver for AlwaysClosed {
+            async fn send(&self, _e: RawEvent) -> std::result::Result<(), DriverError> {
                 Ok(())
             }
-            async fn recv(
-                &self,
-            ) -> std::result::Result<rm_driver::RawEvent, rm_driver::DriverError> {
-                Err(rm_driver::DriverError::Closed)
+            async fn recv(&self) -> std::result::Result<RawEvent, DriverError> {
+                Err(DriverError::Closed)
             }
         }
-        let drv: Arc<dyn rm_driver::Driver> = Arc::new(AlwaysClosed);
-        let h = start_recording(drv, false);
+        let drv: Arc<dyn Driver> = Arc::new(AlwaysClosed);
+        let hub = DriverHub::start(drv);
+        let h = start_recording(hub, false);
         let steps = h.wait_for_close().await.unwrap();
         assert!(steps.is_empty());
     }
