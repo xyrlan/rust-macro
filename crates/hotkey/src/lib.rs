@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rm_driver::{Driver, RawEvent};
+use rm_driver::{DriverHub, RawEvent};
 use rm_macro_model::{KeyCode, Modifier, Trigger};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -27,9 +27,6 @@ impl HotkeyRegistry {
         Self::default()
     }
 
-    /// Register or replace the hotkey for a macro. Modifier lists are
-    /// normalized (sorted + deduplicated) before storage so order and
-    /// duplicates in the input don't affect matching.
     pub async fn bind(&self, id: Uuid, mut trigger: Trigger) {
         let Trigger::Hotkey {
             ref mut modifiers, ..
@@ -43,7 +40,6 @@ impl HotkeyRegistry {
         self.inner.lock().await.by_id.remove(&id);
     }
 
-    /// Returns every macro id whose trigger matches the given pressed-key set.
     pub async fn match_pressed(&self, key: KeyCode, modifiers: &HashSet<Modifier>) -> Vec<Uuid> {
         let g = self.inner.lock().await;
         g.by_id
@@ -80,20 +76,33 @@ impl ListenerHandle {
     }
 }
 
-/// Spawn a task that reads from `driver`, tracks pressed modifiers, and
-/// emits a `HotkeyHit` on `out_tx` for every key press that matches a binding.
+/// Spawn a task that reads from the hub's broadcast stream, tracks pressed
+/// modifiers, and emits a `HotkeyHit` on `out_tx` for every key press that
+/// matches a binding.
+///
+/// **Important**: `hub.subscribe()` is called synchronously on the caller's
+/// thread before spawning. If the hub is already shut down, the task exits
+/// immediately.
 pub fn start_listener(
-    driver: Arc<dyn Driver>,
+    hub: Arc<DriverHub>,
     registry: HotkeyRegistry,
     out_tx: mpsc::UnboundedSender<HotkeyHit>,
 ) -> ListenerHandle {
+    let rx = hub.subscribe();
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let join = tokio::spawn(async move {
+        // Keep `hub` alive for the duration of the listener so the pump task
+        // isn't cancelled by the hub's Drop impl while we still hold a subscriber.
+        let _hub = hub;
+        let mut rx = match rx {
+            Some(rx) => rx,
+            None => return,
+        };
         let mut mods: HashSet<Modifier> = HashSet::new();
         loop {
             tokio::select! {
                 _ = &mut stop_rx => { debug!("hotkey: stop"); break; }
-                got = driver.recv() => match got {
+                got = rx.recv() => match got {
                     Ok(RawEvent::KeyDown { key }) => {
                         if let Some(m) = key_as_modifier(key) {
                             mods.insert(m);
@@ -109,7 +118,13 @@ pub fn start_listener(
                         }
                     }
                     Ok(_) => { /* mouse events not used for hotkeys in v1 */ }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(lagged = n, "hotkey: dropped events");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("hotkey: hub closed");
+                        break;
+                    }
                 }
             }
         }
@@ -161,7 +176,7 @@ mod tests {
             },
         )
         .await;
-        assert!(r.match_pressed(KeyCode::F1, &s).await.is_empty()); // no ctrl pressed
+        assert!(r.match_pressed(KeyCode::F1, &s).await.is_empty());
         s.insert(Modifier::Ctrl);
         assert_eq!(r.match_pressed(KeyCode::F1, &s).await, vec![id]);
     }
@@ -169,6 +184,7 @@ mod tests {
     #[tokio::test]
     async fn listener_dispatches_on_match() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let reg = HotkeyRegistry::new();
         let id = Uuid::new_v4();
         reg.bind(
@@ -181,7 +197,7 @@ mod tests {
         .await;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = start_listener(drv.clone(), reg.clone(), tx);
+        let handle = start_listener(hub, reg.clone(), tx);
 
         drv.inject(RawEvent::KeyDown {
             key: KeyCode::LCtrl,
@@ -200,6 +216,7 @@ mod tests {
     #[tokio::test]
     async fn modifier_release_drops_match() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let reg = HotkeyRegistry::new();
         let id = Uuid::new_v4();
         reg.bind(
@@ -212,7 +229,7 @@ mod tests {
         .await;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = start_listener(drv.clone(), reg.clone(), tx);
+        let handle = start_listener(hub, reg.clone(), tx);
 
         drv.inject(RawEvent::KeyDown {
             key: KeyCode::LCtrl,
@@ -222,7 +239,6 @@ mod tests {
         });
         drv.inject(RawEvent::KeyDown { key: KeyCode::F3 });
 
-        // F3 alone shouldn't fire (binding requires Ctrl).
         let r = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
         assert!(r.is_err(), "expected no hit, got {:?}", r);
 
