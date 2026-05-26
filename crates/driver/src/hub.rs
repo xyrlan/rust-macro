@@ -274,9 +274,7 @@ mod tests {
                 None => return 0u32,
             };
             let mut got = 0u32;
-            while let Ok(res) =
-                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
-            {
+            while let Ok(res) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 if res.is_ok() {
                     got += 1;
                 }
