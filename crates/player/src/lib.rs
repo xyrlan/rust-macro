@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
-use rm_driver::{Driver, RawEvent};
+use rm_driver::{DriverHub, RawEvent};
 use rm_error::{AppError, Result};
 use rm_macro_model::{Macro, PlaybackMode, Step};
 use tokio::sync::oneshot;
@@ -16,14 +16,12 @@ pub struct PlaybackHandle {
 }
 
 impl PlaybackHandle {
-    /// Request the player to stop. The current step is allowed to finish.
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
     }
 
-    /// Await the player. Returns the player's result.
     pub async fn wait(self) -> Result<()> {
         self.join
             .await
@@ -32,16 +30,16 @@ impl PlaybackHandle {
 }
 
 /// Spawn a player task to execute `macro_`. Returns immediately with a handle.
-pub fn play(driver: Arc<dyn Driver>, macro_: Macro) -> PlaybackHandle {
+pub fn play(hub: Arc<DriverHub>, macro_: Macro) -> PlaybackHandle {
     let (stop_tx, stop_rx) = oneshot::channel();
-    let join = tokio::spawn(async move { run(driver, &macro_, stop_rx).await });
+    let join = tokio::spawn(async move { run(hub, &macro_, stop_rx).await });
     PlaybackHandle {
         stop_tx: Some(stop_tx),
         join,
     }
 }
 
-async fn run(driver: Arc<dyn Driver>, m: &Macro, mut stop_rx: oneshot::Receiver<()>) -> Result<()> {
+async fn run(hub: Arc<DriverHub>, m: &Macro, mut stop_rx: oneshot::Receiver<()>) -> Result<()> {
     debug!(macro_name = %m.name, mode = ?m.playback, "player: starting");
     let mut iter = playback_iter(m.playback);
     while iter.next() {
@@ -50,34 +48,30 @@ async fn run(driver: Arc<dyn Driver>, m: &Macro, mut stop_rx: oneshot::Receiver<
                 debug!("player: stop signal");
                 return Ok(());
             }
-            run_step(&*driver, step).await?;
+            run_step(&hub, step).await?;
         }
     }
     Ok(())
 }
 
-async fn run_step(driver: &dyn Driver, step: &Step) -> Result<()> {
+async fn run_step(hub: &DriverHub, step: &Step) -> Result<()> {
     match step {
         Step::KeyPress { key, hold_ms } => {
-            driver
-                .send(RawEvent::KeyDown { key: *key })
+            hub.send(RawEvent::KeyDown { key: *key })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
             tokio::time::sleep(Duration::from_millis((*hold_ms).into())).await;
-            driver
-                .send(RawEvent::KeyUp { key: *key })
+            hub.send(RawEvent::KeyUp { key: *key })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
         Step::KeyDown { key } => {
-            driver
-                .send(RawEvent::KeyDown { key: *key })
+            hub.send(RawEvent::KeyDown { key: *key })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
         Step::KeyUp { key } => {
-            driver
-                .send(RawEvent::KeyUp { key: *key })
+            hub.send(RawEvent::KeyUp { key: *key })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
@@ -86,27 +80,21 @@ async fn run_step(driver: &dyn Driver, step: &Step) -> Result<()> {
             hold_ms,
             at: _,
         } => {
-            // `at` is a TODO for Plan 2 (absolute positioning). For Plan 1 we
-            // emit the click without moving.
-            driver
-                .send(RawEvent::MouseDown { button: *button })
+            hub.send(RawEvent::MouseDown { button: *button })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
             tokio::time::sleep(Duration::from_millis((*hold_ms).into())).await;
-            driver
-                .send(RawEvent::MouseUp { button: *button })
+            hub.send(RawEvent::MouseUp { button: *button })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
         Step::MouseMove { to, mode: _ } => {
-            driver
-                .send(RawEvent::MouseMove { dx: to.x, dy: to.y })
+            hub.send(RawEvent::MouseMove { dx: to.x, dy: to.y })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
         Step::MouseScroll { delta } => {
-            driver
-                .send(RawEvent::MouseWheel { delta: *delta })
+            hub.send(RawEvent::MouseWheel { delta: *delta })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
@@ -122,9 +110,8 @@ async fn run_step(driver: &dyn Driver, step: &Step) -> Result<()> {
     Ok(())
 }
 
-/// State machine for the loop bound.
 struct PlaybackIter {
-    remaining: Option<u64>, // None = infinite
+    remaining: Option<u64>,
 }
 
 impl PlaybackIter {
@@ -171,6 +158,7 @@ mod tests {
     #[tokio::test]
     async fn keypress_emits_down_then_up() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let m = macro_with_steps(
             vec![Step::KeyPress {
                 key: KeyCode::A,
@@ -178,7 +166,7 @@ mod tests {
             }],
             PlaybackMode::Once,
         );
-        play(drv.clone(), m).wait().await.unwrap();
+        play(hub, m).wait().await.unwrap();
         let sent = drv.drain_sent();
         assert_eq!(
             sent,
@@ -191,10 +179,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_is_random_within_range() {
-        // Smoke: run Wait { 10, 20 } a few times; just verify it doesn't
-        // panic and the player completes. Time bounds aren't asserted —
-        // OS scheduling makes that flaky.
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let m = macro_with_steps(
             vec![Step::Wait {
                 min_ms: 10,
@@ -202,13 +188,14 @@ mod tests {
             }],
             PlaybackMode::Repeat { count: 5 },
         );
-        play(drv.clone(), m).wait().await.unwrap();
+        play(hub, m).wait().await.unwrap();
         assert!(drv.sent_snapshot().is_empty());
     }
 
     #[tokio::test]
     async fn mouse_click_emits_down_up() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let m = macro_with_steps(
             vec![Step::MouseClick {
                 button: rm_macro_model::MouseButton::Left,
@@ -217,7 +204,7 @@ mod tests {
             }],
             PlaybackMode::Once,
         );
-        play(drv.clone(), m).wait().await.unwrap();
+        play(hub, m).wait().await.unwrap();
         let sent = drv.drain_sent();
         assert!(matches!(sent[0], RawEvent::MouseDown { .. }));
         assert!(matches!(sent[1], RawEvent::MouseUp { .. }));
@@ -226,6 +213,7 @@ mod tests {
     #[tokio::test]
     async fn repeat_n_runs_n_times() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let m = macro_with_steps(
             vec![Step::KeyPress {
                 key: KeyCode::X,
@@ -233,13 +221,14 @@ mod tests {
             }],
             PlaybackMode::Repeat { count: 4 },
         );
-        play(drv.clone(), m).wait().await.unwrap();
-        assert_eq!(drv.drain_sent().len(), 4 * 2); // 4 iterations × (down+up)
+        play(hub, m).wait().await.unwrap();
+        assert_eq!(drv.drain_sent().len(), 4 * 2);
     }
 
     #[tokio::test]
     async fn once_runs_once() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let m = macro_with_steps(
             vec![Step::KeyPress {
                 key: KeyCode::X,
@@ -247,13 +236,14 @@ mod tests {
             }],
             PlaybackMode::Once,
         );
-        play(drv.clone(), m).wait().await.unwrap();
+        play(hub, m).wait().await.unwrap();
         assert_eq!(drv.drain_sent().len(), 2);
     }
 
     #[tokio::test]
     async fn loop_stops_on_signal() {
         let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
         let m = macro_with_steps(
             vec![
                 Step::KeyPress {
@@ -267,11 +257,10 @@ mod tests {
             ],
             PlaybackMode::Loop,
         );
-        let mut h = play(drv.clone(), m);
+        let mut h = play(hub, m);
         tokio::time::sleep(Duration::from_millis(50)).await;
         h.stop();
         h.wait().await.unwrap();
-        // It should have completed some iterations and stopped.
         let count = drv.drain_sent().len();
         assert!(
             count > 0 && count.is_multiple_of(2),
