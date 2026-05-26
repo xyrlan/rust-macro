@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Physical key, identified by USB HID scancode where possible.
-/// Plan 2 will add `From<interception::ScanCode>` impls.
+/// Scancode mappings live in `rm-driver-interception` (Plan 2b), not here,
+/// so this crate stays free of any system-driver dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyCode {
