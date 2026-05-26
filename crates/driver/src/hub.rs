@@ -173,4 +173,37 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn pump_exits_propagates_closed_to_subscribers() {
+        // A Driver that immediately returns Closed on recv. Send is irrelevant.
+        struct AlwaysClosed;
+        #[async_trait::async_trait]
+        impl Driver for AlwaysClosed {
+            async fn send(&self, _: RawEvent) -> Result<(), DriverError> {
+                Ok(())
+            }
+            async fn recv(&self) -> Result<RawEvent, DriverError> {
+                Err(DriverError::Closed)
+            }
+        }
+
+        let hub = DriverHub::start(Arc::new(AlwaysClosed));
+        // Subscribe synchronously before the pump task gets to run.
+        let mut rx = hub.subscribe().expect("subscribe before pump exit");
+
+        // The next recv should resolve to Closed once the pump observes the
+        // driver's Closed and drops the Sender.
+        let result = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            matches!(result, Ok(Err(broadcast::error::RecvError::Closed))),
+            "expected Ok(Err(Closed)), got {result:?}"
+        );
+
+        // After the pump has exited, new subscribes return None.
+        assert!(
+            hub.subscribe().is_none(),
+            "subscribe after pump exit should return None"
+        );
+    }
 }
