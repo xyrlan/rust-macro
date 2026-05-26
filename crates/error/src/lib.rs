@@ -60,7 +60,10 @@ impl AppError {
     }
 
     pub fn to_wire(&self) -> WireError {
-        WireError { kind: self.kind(), message: self.to_string() }
+        WireError {
+            kind: self.kind(),
+            message: self.to_string(),
+        }
     }
 }
 
