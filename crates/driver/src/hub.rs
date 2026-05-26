@@ -252,4 +252,42 @@ mod tests {
             "expected Ok event after Lagged, got {next:?}"
         );
     }
+
+    /// **Documentation test for the subscribe-before-emit invariant.**
+    ///
+    /// Subscribing inside a spawned task — instead of synchronously on the
+    /// caller thread — races with the pump. The pump can deliver an injected
+    /// event before the task's subscribe call lands, silently dropping it.
+    /// This test demonstrates the race: it passes whether the event was lost
+    /// (0 events seen) or caught in time (1 event seen). The point is the
+    /// documentation, not the assertion.
+    #[tokio::test]
+    async fn subscribe_inside_spawn_can_lose_events_documenting_invariant() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+
+        let hub2 = hub.clone();
+        let join = tokio::spawn(async move {
+            // WRONG PATTERN: subscribe inside the task.
+            let mut rx = match hub2.subscribe() {
+                Some(rx) => rx,
+                None => return 0u32,
+            };
+            let mut got = 0u32;
+            while let Ok(res) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                if res.is_ok() {
+                    got += 1;
+                }
+            }
+            got
+        });
+
+        // Inject immediately — the spawned task may or may not have subscribed yet.
+        drv.inject(RawEvent::KeyDown { key: KeyCode::A });
+
+        let count = join.await.unwrap();
+        assert!(count <= 1, "expected 0 or 1 events (race), got {count}");
+    }
 }
