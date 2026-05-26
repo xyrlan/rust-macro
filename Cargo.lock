@@ -648,6 +648,7 @@ dependencies = [
  "rm-recorder",
  "rm-storage",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
