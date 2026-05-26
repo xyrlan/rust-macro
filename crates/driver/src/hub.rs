@@ -206,4 +206,19 @@ mod tests {
             "subscribe after pump exit should return None"
         );
     }
+
+    #[tokio::test]
+    async fn drop_cancels_pump_and_closes_subscribers() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv);
+        let mut rx = hub.subscribe().unwrap();
+
+        drop(hub);
+
+        let result = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            matches!(result, Ok(Err(broadcast::error::RecvError::Closed))),
+            "expected Closed after hub drop, got {result:?}"
+        );
+    }
 }
