@@ -209,7 +209,10 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 ```
+
+`serde_json` is a regular dependency (not dev) because the `From<serde_json::Error>` impl lives in the lib code, not just tests.
 
 - [ ] **Step 2: Write failing tests**
 
