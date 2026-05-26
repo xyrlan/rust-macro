@@ -1,0 +1,16 @@
+[package]
+name = "rm-hotkey"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rm-driver = { path = "../driver" }
+rm-error = { path = "../error" }
+rm-macro-model = { path = "../macro_model" }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
