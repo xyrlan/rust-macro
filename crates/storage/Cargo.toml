@@ -1,0 +1,15 @@
+[package]
+name = "rm-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rm-error = { path = "../error" }
+rm-macro-model = { path = "../macro_model" }
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+chrono.workspace = true
