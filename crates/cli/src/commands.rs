@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rm_driver::Driver;
+use rm_driver::{Driver, DriverHub};
 use rm_error::{AppError, Result};
 use rm_macro_model::{KeyCode, Macro, Modifier, PlaybackMode, Trigger};
 use rm_player::play;
@@ -11,11 +11,12 @@ use rm_storage::{delete_macro, load_all, save_macro};
 use crate::stdio_driver::StdioDriver;
 
 /// Record from stdin (JSONL of RawEvent). The recorder exits naturally when
-/// stdin EOFs (the StdioDriver returns `DriverError::Closed`), so this just
-/// awaits the task without ever sending a stop signal.
+/// the hub propagates `Closed` (driven by stdin EOF), so this just awaits the
+/// task without ever sending a stop signal.
 pub async fn cmd_record(root: &Path, name: &str) -> Result<()> {
     let drv: Arc<dyn Driver> = Arc::new(StdioDriver::new());
-    let handle = start_recording(drv, false);
+    let hub = DriverHub::start(drv);
+    let handle = start_recording(hub, false);
     let steps = handle.wait_for_close().await?;
     if steps.is_empty() {
         return Err(AppError::Other("no events recorded".into()));
@@ -51,7 +52,8 @@ pub async fn cmd_play(root: &Path, name: &str) -> Result<()> {
         m.playback = PlaybackMode::Once;
     }
     let drv: Arc<dyn Driver> = Arc::new(StdioDriver::new());
-    play(drv, m).wait().await
+    let hub = DriverHub::start(drv);
+    play(hub, m).wait().await
 }
 
 pub fn cmd_list(root: &Path) -> Result<()> {
