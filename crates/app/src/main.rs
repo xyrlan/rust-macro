@@ -61,6 +61,9 @@ fn main() {
             commands::load_settings,
             commands::save_settings,
             commands::driver_status,
+            commands::install_driver,
+            commands::uninstall_driver,
+            commands::clear_pending_reboot,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

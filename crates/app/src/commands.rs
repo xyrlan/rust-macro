@@ -461,6 +461,75 @@ pub async fn driver_status(state: State<'_, AppState>) -> Result<crate::dto::Dri
     Ok(crate::dto::DriverStateDto { status, pending_reboot })
 }
 
+fn resource_path_or_err(app: &AppHandle, rel: &str) -> Result<std::path::PathBuf, AppError> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| AppError::Other(format!("resource_dir lookup: {e}")))?;
+    Ok(resource_dir.join(rel))
+}
+
+#[tauri::command]
+pub async fn install_driver(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), WireError> {
+    let installer = resource_path_or_err(&app, "installers/interception/install-interception.exe")
+        .map_err(|e| e.to_wire())?;
+    if !installer.exists() {
+        return Err(AppError::Other(format!(
+            "installer not bundled at {}",
+            installer.display()
+        ))
+        .to_wire());
+    }
+    let storage_root = state.storage_root.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::driver_install::install_driver(&installer, &storage_root)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("install task join: {e}")).to_wire())?
+    .map_err(|e| e.to_wire())?;
+    *state.pending_reboot.lock().await = true;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn uninstall_driver(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), WireError> {
+    // Uninstall uses the SAME bundled binary with /uninstall — handled
+    // inside driver_install::uninstall_driver. So the resource path is
+    // install-interception.exe (not a separate uninstaller).
+    let installer = resource_path_or_err(&app, "installers/interception/install-interception.exe")
+        .map_err(|e| e.to_wire())?;
+    if !installer.exists() {
+        return Err(AppError::Other(format!(
+            "installer not bundled at {}",
+            installer.display()
+        ))
+        .to_wire());
+    }
+    let storage_root = state.storage_root.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::driver_install::uninstall_driver(&installer, &storage_root)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("uninstall task join: {e}")).to_wire())?
+    .map_err(|e| e.to_wire())?;
+    *state.pending_reboot.lock().await = true;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_pending_reboot(state: State<'_, AppState>) -> Result<(), WireError> {
+    crate::driver_install::clear_pending_marker(&state.storage_root)
+        .map_err(|e| e.to_wire())?;
+    *state.pending_reboot.lock().await = false;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
