@@ -27,6 +27,36 @@ impl PlaybackHandle {
             .await
             .map_err(|e| AppError::Other(format!("player task panicked: {e}")))?
     }
+
+    /// Drive the playback to completion, observing an external stop signal.
+    /// When `external_stop_rx` fires, sends the internal stop signal and
+    /// awaits the player's clean exit between steps.
+    pub async fn run_with_stop(
+        mut self,
+        external_stop_rx: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        // We split into two phases: a select! that races external_stop_rx
+        // against the inner JoinHandle, then a tail that awaits any remaining
+        // work after the stop has been signaled.
+        let join = self.join;
+        tokio::pin!(join);
+        let stop_tx = self.stop_tx.take();
+
+        tokio::select! {
+            // External stop arrived first. Fire the internal stop_tx (if not
+            // already taken) and fall through to await the join.
+            _ = external_stop_rx => {
+                if let Some(tx) = stop_tx { let _ = tx.send(()); }
+                (&mut join).await
+                    .map_err(|e| AppError::Other(format!("player task panicked: {e}")))?
+            }
+            // Natural completion arrived first. Drop the unused stop_tx.
+            result = &mut join => {
+                drop(stop_tx);
+                result.map_err(|e| AppError::Other(format!("player task panicked: {e}")))?
+            }
+        }
+    }
 }
 
 /// Spawn a player task to execute `macro_`. Returns immediately with a handle.
@@ -266,5 +296,26 @@ mod tests {
             count > 0 && count.is_multiple_of(2),
             "sent count was {count}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_with_stop_signals_clean_exit() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+        let m = macro_with_steps(
+            vec![
+                Step::KeyPress { key: KeyCode::X, hold_ms: 1 },
+                Step::Wait { min_ms: 5, max_ms: 5 },
+            ],
+            PlaybackMode::Loop,
+        );
+        let h = play(hub, m);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let join = tokio::spawn(async move { h.run_with_stop(stop_rx).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).unwrap();
+        join.await.unwrap().unwrap();
+        let count = drv.drain_sent().len();
+        assert!(count > 0 && count.is_multiple_of(2));
     }
 }
