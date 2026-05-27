@@ -24,7 +24,7 @@ Backend:
 - `crates/app/icons/32x32.png`
 - `crates/app/icons/128x128.png`
 - `crates/app/icons/128x128@2x.png`
-- `crates/app/icons/icon.ico`
+- `crates/app/icons/icon.ico` (Windows runtime icon)
 - `crates/app/src/main.rs`
 - `crates/app/src/state.rs`
 - `crates/app/src/commands.rs`
@@ -103,6 +103,7 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+dirs = "5"
 kanata-interception = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -148,7 +149,7 @@ crates/app/ui/dist/
 crates/app/ui/.vite/
 ```
 
-- [ ] **Step 3: Verify the workspace still parses (the new member doesn't exist yet — Task 3 creates it; an error mentioning `crates/app/Cargo.toml` is expected)**
+- [ ] **Step 3: Verify the workspace still parses (the new member doesn't exist yet — Task 5 creates it; an error mentioning `crates/app/Cargo.toml` is expected)**
 
 Run: `cargo metadata --no-deps --format-version 1 1>$null`
 Expected: error message mentioning `crates/app/Cargo.toml` does not exist.
@@ -228,7 +229,158 @@ git commit -m "feat(error): add AppError::PlaybackActive for GUI single-playback
 
 ---
 
-## Task 3: Scaffold `rm-app` crate (Cargo.toml, build.rs, minimal main.rs)
+## Task 3: Extract `open_with_status` to `rm-driver-interception`; refactor CLI
+
+**Files:**
+- Modify: `crates/driver-interception/src/lib.rs` (or a new module — implementer's choice)
+- Modify: `crates/driver-interception/Cargo.toml`
+- Modify: `crates/cli/src/commands.rs`
+
+Plan 2b's CLI defined a private `open_interception()` helper that maps `InterceptionDriver::new()` failures to `AppError` via `detect_status()`. Plan 3a needs the identical logic. Extract it to the driver crate so both consumers use one source of truth.
+
+- [ ] **Step 1: Add `open_with_status()` to `rm-driver-interception`**
+
+In `crates/driver-interception/src/lib.rs`, add:
+
+```rust
+use rm_error::AppError;
+
+/// Open an Interception context, mapping failure to `AppError` via
+/// `detect_status()`. Consumers (CLI, GUI) should prefer this over
+/// `InterceptionDriver::new()` + manual status mapping.
+pub fn open_with_status() -> Result<InterceptionDriver, AppError> {
+    InterceptionDriver::new().map_err(|orig| match detect_status() {
+        DriverStatus::NotInstalled => AppError::DriverNotInstalled,
+        DriverStatus::InstalledNotRunning => AppError::DriverNotRunning,
+        DriverStatus::Running => AppError::DriverIo(orig.to_string()),
+    })
+}
+```
+
+(The function uses items already exported from `status` and `driver` modules: `InterceptionDriver`, `detect_status`, `DriverStatus`. They are already re-exported at the crate root; if not, the implementer adds the appropriate `pub use`.)
+
+Also add `rm-error = { path = "../error" }` to `crates/driver-interception/Cargo.toml`'s `[dependencies]` (it isn't currently a dep).
+
+- [ ] **Step 2: Refactor `crates/cli/src/commands.rs` to use the new helper**
+
+Replace the existing `fn open_interception()` with a one-liner that delegates to the new helper:
+
+```rust
+#[cfg(feature = "interception")]
+fn open_interception() -> Result<rm_driver_interception::InterceptionDriver> {
+    rm_driver_interception::open_with_status()
+}
+```
+
+(The CLI's `Result<T>` is `std::result::Result<T, AppError>`, so the helper's return type matches directly.)
+
+- [ ] **Step 3: Run all tests**
+
+```powershell
+cargo test --workspace
+```
+
+Expected: PASS — no regressions; the CLI's behavior is identical.
+
+- [ ] **Step 4: Commit**
+
+```powershell
+git add crates/driver-interception/src/lib.rs crates/driver-interception/Cargo.toml crates/cli/src/commands.rs
+git commit -m "refactor: extract open_with_status to rm-driver-interception (shared by CLI + GUI)"
+```
+
+---
+
+## Task 4: Add `PlaybackHandle::run_with_stop` to `rm-player`
+
+**Files:**
+- Modify: `crates/player/src/lib.rs`
+
+The current `PlaybackHandle` exposes `stop(&mut self)` and `wait(self)` — but these can't be called concurrently from a single caller. Plan 3a's GUI needs to be able to signal "please stop" from the `stop_playback` Tauri command while a separate supervisor task is awaiting completion. This task adds a method that takes both responsibilities at once.
+
+- [ ] **Step 1: Add a failing test first**
+
+Append to `mod tests` in `crates/player/src/lib.rs`:
+
+```rust
+    #[tokio::test]
+    async fn run_with_stop_signals_clean_exit() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+        let m = macro_with_steps(
+            vec![
+                Step::KeyPress { key: KeyCode::X, hold_ms: 1 },
+                Step::Wait { min_ms: 5, max_ms: 5 },
+            ],
+            PlaybackMode::Loop,
+        );
+        let h = play(hub, m);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let join = tokio::spawn(async move { h.run_with_stop(stop_rx).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).unwrap();
+        join.await.unwrap().unwrap();
+        let count = drv.drain_sent().len();
+        assert!(count > 0 && count.is_multiple_of(2));
+    }
+```
+
+- [ ] **Step 2: Run the test — it fails**
+
+Run: `cargo test -p rm-player run_with_stop_signals_clean_exit`
+Expected: FAIL — `run_with_stop` is undefined.
+
+- [ ] **Step 3: Implement `run_with_stop` on `PlaybackHandle`**
+
+In `crates/player/src/lib.rs`, add this method inside `impl PlaybackHandle`:
+
+```rust
+    /// Drive the playback to completion, observing an external stop signal.
+    /// When `external_stop_rx` fires, sends the internal stop signal and
+    /// awaits the player's clean exit between steps.
+    pub async fn run_with_stop(
+        mut self,
+        external_stop_rx: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        // We split into two phases: a select! that races external_stop_rx
+        // against the inner JoinHandle, then a tail that awaits any remaining
+        // work after the stop has been signaled.
+        let join = self.join;
+        tokio::pin!(join);
+        let stop_tx = self.stop_tx.take();
+
+        tokio::select! {
+            // External stop arrived first. Fire the internal stop_tx (if not
+            // already taken) and fall through to await the join.
+            _ = external_stop_rx => {
+                if let Some(tx) = stop_tx { let _ = tx.send(()); }
+                (&mut join).await
+                    .map_err(|e| AppError::Other(format!("player task panicked: {e}")))?
+            }
+            // Natural completion arrived first. Drop the unused stop_tx.
+            result = &mut join => {
+                drop(stop_tx);
+                result.map_err(|e| AppError::Other(format!("player task panicked: {e}")))?
+            }
+        }
+    }
+```
+
+- [ ] **Step 4: Run the test — it passes**
+
+Run: `cargo test -p rm-player`
+Expected: PASS — all prior tests + the new one (~7 tests).
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add crates/player/src/lib.rs
+git commit -m "feat(player): add PlaybackHandle::run_with_stop for external stop signaling"
+```
+
+---
+
+## Task 5: Scaffold `rm-app` crate (Cargo.toml, build.rs, minimal main.rs)
 
 **Files:**
 - Create: `crates/app/Cargo.toml`
@@ -247,15 +399,23 @@ edition.workspace = true
 name = "rust-macro"
 path = "src/main.rs"
 
+[features]
+default = ["interception"]
+# Pulls in rm-driver-interception. Disable with --no-default-features for
+# builds that need to avoid the transitive LGPL-3.0 obligation from
+# interception-sys (see LICENSES.md). Without this feature, `play_macro`
+# returns DriverNotInstalled and the GUI is read-only.
+interception = ["dep:rm-driver-interception"]
+
 [build-dependencies]
 tauri-build.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
-dirs = "5"
+dirs.workspace = true
 rm-driver = { path = "../driver" }
-rm-driver-interception = { path = "../driver-interception" }
+rm-driver-interception = { path = "../driver-interception", optional = true }
 rm-error = { path = "../error" }
 rm-macro-model = { path = "../macro_model" }
 rm-player = { path = "../player" }
@@ -271,6 +431,8 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 ```
+
+Note: `dirs` is promoted to a workspace dependency in Task 1 (Plan 3a). `crates/cli/Cargo.toml` still pins `dirs = "5"` locally; flag as a future cleanup to switch the CLI to `dirs.workspace = true` — not required in 3a.
 
 - [ ] **Step 2: Write `crates/app/build.rs`**
 
@@ -305,9 +467,9 @@ fn main() {
 }
 ```
 
-- [ ] **Step 4: Defer compilation verification to Task 4**
+- [ ] **Step 4: Defer compilation verification to Task 6**
 
-`cargo check -p rm-app` will fail until `tauri.conf.json` and the frontend `index.html` exist — both are created in Task 4. Commit this task's files first, then continue.
+`cargo check -p rm-app` will fail until `tauri.conf.json` and the frontend `index.html` exist — both are created in Task 6. Commit this task's files first, then continue.
 
 - [ ] **Step 5: Commit**
 
@@ -318,7 +480,7 @@ git commit -m "feat(app): scaffold rm-app crate (Cargo.toml + minimal Tauri main
 
 ---
 
-## Task 4: Tauri config + placeholder icons + frontend skeleton
+## Task 6: Tauri config + placeholder icons + frontend skeleton
 
 **Files:**
 - Create: `crates/app/tauri.conf.json`
@@ -369,7 +531,6 @@ git commit -m "feat(app): scaffold rm-app crate (Cargo.toml + minimal Tauri main
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns",
       "icons/icon.ico"
     ]
   }
@@ -389,10 +550,10 @@ npx @tauri-apps/cli icon path\to\source.png --output icons
 
 If `npx @tauri-apps/cli icon` is unavailable or you want a fully offline workflow:
 
-1. Create `icons/32x32.png`, `icons/128x128.png`, `icons/128x128@2x.png`, `icons/icon.ico`, `icons/icon.icns` as 1×1-pixel placeholder PNGs (any solid color). The simplest way is to copy a small PNG from anywhere on your system into all five names and rename. Tauri will warn but build succeeds.
+1. Create `icons/32x32.png`, `icons/128x128.png`, `icons/128x128@2x.png`, `icons/icon.ico` as 1×1-pixel placeholder PNGs (any solid color). The simplest way is to copy a small PNG from anywhere on your system into all four names and rename. Tauri will warn but build succeeds.
 2. For Windows-only dev, `icons/icon.ico` is the file actually used at runtime; the rest can be 1×1 placeholders.
 
-The implementer should verify all five files exist with non-zero size; the actual visual content is replaced in Plan 3b polish.
+The implementer should verify all four files exist with non-zero size; the actual visual content is replaced in Plan 3b polish.
 
 - [ ] **Step 3: Write `crates/app/ui/package.json`**
 
@@ -430,6 +591,7 @@ The implementer should verify all five files exist with non-zero size; the actua
 - [ ] **Step 4: Write `crates/app/ui/vite.config.ts`**
 
 ```ts
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
@@ -647,12 +809,12 @@ code {
 
 ```svelte
 <script lang="ts">
-  // Plan 3a: placeholder root. Replaced in Task 7.
+  // Plan 3a: placeholder root. Replaced in Task 9.
 </script>
 
 <main style="padding: 2rem;">
   <h1>rust-macro</h1>
-  <p>GUI scaffold up. Macro list lands in Task 7.</p>
+  <p>GUI scaffold up. Macro list lands in Task 9.</p>
 </main>
 ```
 
@@ -702,11 +864,11 @@ git add crates/app/tauri.conf.json crates/app/icons crates/app/ui/
 git commit -m "feat(app): Tauri 2 config + Svelte 5 frontend scaffold (hello world)"
 ```
 
-Do NOT commit `crates/app/ui/node_modules/` or `crates/app/ui/dist/` — they are gitignored from Task 1. `package-lock.json` SHOULD be committed.
+Do NOT commit `crates/app/ui/node_modules/` or `crates/app/ui/dist/` — they are gitignored from Task 1. The `package-lock.json` SHOULD be committed (it's not gitignored). Verify with `git status crates/app/ui/package-lock.json` after running `npm install` — it should show as a new file ready to stage.
 
 ---
 
-## Task 5: DTOs (`dto.rs`) with serde + roundtrip tests
+## Task 7: DTOs (`dto.rs`) with serde + roundtrip tests
 
 **Files:**
 - Create: `crates/app/src/dto.rs`
@@ -775,7 +937,7 @@ impl From<&PlaybackMode> for PlaybackModeDto {
     fn from(p: &PlaybackMode) -> Self {
         match p {
             PlaybackMode::Once => PlaybackModeDto::Once,
-            PlaybackMode::Repeat(n) => PlaybackModeDto::Repeat { value: *n },
+            PlaybackMode::Repeat { count } => PlaybackModeDto::Repeat { value: *count },
             PlaybackMode::Loop => PlaybackModeDto::Loop,
             PlaybackMode::Toggle => PlaybackModeDto::Toggle,
         }
@@ -786,7 +948,7 @@ impl From<PlaybackModeDto> for PlaybackMode {
     fn from(p: PlaybackModeDto) -> Self {
         match p {
             PlaybackModeDto::Once => PlaybackMode::Once,
-            PlaybackModeDto::Repeat { value } => PlaybackMode::Repeat(value),
+            PlaybackModeDto::Repeat { value } => PlaybackMode::Repeat { count: value },
             PlaybackModeDto::Loop => PlaybackMode::Loop,
             PlaybackModeDto::Toggle => PlaybackMode::Toggle,
         }
@@ -926,7 +1088,7 @@ git commit -m "feat(app): wire DTOs for Tauri commands (MacroDto, TriggerDto, Pl
 
 ---
 
-## Task 6: `AppState` + `load_macros` + `delete_macro` commands
+## Task 8: `AppState` + `load_macros` + `delete_macro` commands
 
 **Files:**
 - Create: `crates/app/src/state.rs`
@@ -943,7 +1105,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rm_driver::DriverHub;
-use rm_error::AppError;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -958,11 +1119,12 @@ pub struct AppState {
 pub struct ActivePlayback {
     pub macro_id: Uuid,
     pub macro_name: String,
-    /// Aborting this handle cancels the running player task. We do not store
-    /// the `JoinHandle` itself because `play_macro` needs to keep ownership
-    /// of it to drive the task to completion; `AbortHandle` gives us a
-    /// cancellation lever without taking the join away.
-    pub abort_handle: tokio::task::AbortHandle,
+    /// User-initiated stop signal. `Some` while the playback is running;
+    /// `stop_playback` takes the sender out and fires it. The supervisor
+    /// task spawned by `play_macro` observes this via a relay and forwards
+    /// it to `PlaybackHandle::run_with_stop`. Once fired, the supervisor
+    /// clears the active slot and emits `playback_finished`.
+    pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl AppState {
@@ -984,7 +1146,7 @@ impl AppState {
 
 use rm_error::{AppError, WireError};
 use rm_macro_model::Macro;
-use rm_storage::{delete_macro as storage_delete, load_all};
+use rm_storage::{delete_macro as storage_delete, load_all, load_macro};
 use tauri::State;
 use uuid::Uuid;
 
@@ -1002,12 +1164,11 @@ pub async fn delete_macro(
     state: State<'_, AppState>,
     id: Uuid,
 ) -> Result<(), WireError> {
-    // Verify the macro exists first so we return MacroNotFound instead of a
-    // silent no-op when the UI is out of sync.
-    let macros = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
-    if !macros.iter().any(|m| m.id == id) {
-        return Err(AppError::MacroNotFound(id.to_string()).to_wire());
-    }
+    // load_macro returns MacroNotFound for a missing file via a single
+    // path.exists() check — cheaper than load_all on machines with many
+    // macros, and gives us the same "fail with MacroNotFound rather than a
+    // silent no-op" behavior when the UI is out of sync.
+    load_macro(&state.storage_root, id).map_err(|e| e.to_wire())?;
     storage_delete(&state.storage_root, id).map_err(|e| e.to_wire())?;
     Ok(())
 }
@@ -1149,7 +1310,7 @@ git commit -m "feat(app): AppState + load_macros/delete_macro Tauri commands"
 
 ---
 
-## Task 7: Frontend — `api.ts`, `types.ts`, macros store, MacroTable, MacroRow
+## Task 9: Frontend — `api.ts`, `types.ts`, macros store, MacroTable, MacroRow
 
 **Files:**
 - Create: `crates/app/ui/src/lib/types.ts`
@@ -1169,21 +1330,33 @@ git commit -m "feat(app): AppState + load_macros/delete_macro Tauri commands"
 // from a stale mirror will surface as "missing field" deserialisation errors
 // in the Rust backend, which become WireError toasts in the UI.
 
+// Values are the snake_case serde renames from rm_macro_model::KeyCode /
+// Modifier. Keep this list in sync with crates/macro_model/src/input.rs.
+// Display the user-facing label via the `keyCodeLabel(key)` helper below.
 export type KeyCode =
-  | "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M"
-  | "N" | "O" | "P" | "Q" | "R" | "S" | "T" | "U" | "V" | "W" | "X" | "Y" | "Z"
-  | "Num0" | "Num1" | "Num2" | "Num3" | "Num4" | "Num5"
-  | "Num6" | "Num7" | "Num8" | "Num9"
-  | "F1" | "F2" | "F3" | "F4" | "F5" | "F6"
-  | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
-  | "LShift" | "RShift" | "LCtrl" | "RCtrl" | "LAlt" | "RAlt" | "LWin" | "RWin"
-  | "Space" | "Enter" | "Tab" | "Backspace" | "Escape" | "CapsLock"
-  | "Up" | "Down" | "Left" | "Right"
-  | "Insert" | "Delete" | "Home" | "End" | "PageUp" | "PageDown"
-  | "Minus" | "Equals" | "LBracket" | "RBracket" | "Backslash" | "Semicolon"
-  | "Apostrophe" | "Backtick" | "Comma" | "Period" | "Slash";
+  | "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m"
+  | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z"
+  | "num0" | "num1" | "num2" | "num3" | "num4"
+  | "num5" | "num6" | "num7" | "num8" | "num9"
+  | "f1" | "f2" | "f3" | "f4" | "f5" | "f6"
+  | "f7" | "f8" | "f9" | "f10" | "f11" | "f12"
+  | "l_shift" | "r_shift" | "l_ctrl" | "r_ctrl"
+  | "l_alt" | "r_alt" | "l_win" | "r_win"
+  | "space" | "enter" | "tab" | "backspace" | "escape" | "caps_lock"
+  | "up" | "down" | "left" | "right"
+  | "insert" | "delete" | "home" | "end" | "page_up" | "page_down"
+  | "minus" | "equals" | "l_bracket" | "r_bracket" | "backslash" | "semicolon"
+  | "apostrophe" | "backtick" | "comma" | "period" | "slash";
 
-export type Modifier = "Ctrl" | "Shift" | "Alt" | "Win";
+export type Modifier = "ctrl" | "shift" | "alt" | "win";
+
+/** Format a snake_case KeyCode/Modifier for display. */
+export function inputLabel(s: KeyCode | Modifier): string {
+  return s
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 export type Trigger = { type: "hotkey"; key: KeyCode; modifiers: Modifier[] };
 
@@ -1232,6 +1405,11 @@ export function isWireError(e: unknown): e is WireError {
 - [ ] **Step 2: Write `crates/app/ui/src/lib/api.ts`**
 
 ```ts
+// Tauri 2 converts JS argument keys from camelCase to snake_case automatically
+// when calling Rust commands. Single-word args (`id`, `name`) are unaffected;
+// multi-word args added later (e.g. `macroId`) must use camelCase here and
+// snake_case in the Rust signature. Keep this in mind when adding commands.
+
 import { invoke } from "@tauri-apps/api/core";
 import type { MacroDto, Trigger, PlaybackMode } from "./types";
 
@@ -1243,7 +1421,7 @@ export async function deleteMacro(id: string): Promise<void> {
   await invoke("delete_macro", { id });
 }
 
-// Stubs for commands added in later tasks. Frontend uses them in Task 9+
+// Stubs for commands added in later tasks. Frontend uses them in Task 11+
 // once they're implemented in the backend.
 export async function updateMacroMetadata(
   id: string,
@@ -1479,6 +1657,7 @@ export function snapshot(): MacroDto[] {
 ```svelte
 <script lang="ts">
   import type { MacroDto } from "../types";
+  import { inputLabel } from "../types";
 
   let {
     macro,
@@ -1494,7 +1673,7 @@ export function snapshot(): MacroDto[] {
 
   function hotkeyLabel(macro: MacroDto): string {
     if (macro.trigger.type !== "hotkey") return "—";
-    const parts = [...macro.trigger.modifiers, macro.trigger.key];
+    const parts = [...macro.trigger.modifiers, macro.trigger.key].map(inputLabel);
     return parts.join("+");
   }
 
@@ -1647,12 +1826,12 @@ export function snapshot(): MacroDto[] {
   import MacroTable from "./lib/components/MacroTable.svelte";
   import ToastHost from "./lib/components/ToastHost.svelte";
 
-  // EditMetadataModal hook-up lands in Task 9. For now, edit shows a toast.
+  // EditMetadataModal hook-up lands in Task 11. For now, edit shows a toast.
   function handlePlay(_id: string) {
-    // Wired up in Task 11.
+    // Wired up in Task 13.
   }
   function handleEdit(_id: string) {
-    // Wired up in Task 9.
+    // Wired up in Task 11.
   }
 
   onMount(() => {
@@ -1704,7 +1883,7 @@ git commit -m "feat(app/ui): macro list view + toast host + typed API client"
 
 ---
 
-## Task 8: `update_macro_metadata` command
+## Task 10: `update_macro_metadata` command
 
 **Files:**
 - Modify: `crates/app/src/commands.rs`
@@ -1734,7 +1913,7 @@ Append this test to `crates/app/src/commands.rs`'s `mod tests`:
             key: KeyCode::F5,
             modifiers: vec![Modifier::Alt],
         };
-        loaded.playback = PlaybackMode::Repeat(3);
+        loaded.playback = PlaybackMode::Repeat { count: 3 };
         loaded.updated_at = chrono::Utc::now();
         save_macro(&state.storage_root, &loaded).unwrap();
 
@@ -1746,7 +1925,7 @@ Append this test to `crates/app/src/commands.rs`'s `mod tests`:
         assert_eq!(reloaded.name, "after");
         assert!(matches!(reloaded.trigger,
             Trigger::Hotkey { key: KeyCode::F5, .. }));
-        assert!(matches!(reloaded.playback, PlaybackMode::Repeat(3)));
+        assert!(matches!(reloaded.playback, PlaybackMode::Repeat { count: 3 }));
         assert_eq!(reloaded.steps.len(), 1); // steps preserved
     }
 ```
@@ -1822,7 +2001,7 @@ git commit -m "feat(app): update_macro_metadata Tauri command"
 
 ---
 
-## Task 9: Frontend — `EditMetadataModal` + `HotkeyPicker`
+## Task 11: Frontend — `EditMetadataModal` + `HotkeyPicker`
 
 **Files:**
 - Create: `crates/app/ui/src/lib/components/EditMetadataModal.svelte`
@@ -1862,17 +2041,19 @@ Move the import of `Trigger, PlaybackMode` to the top of the file (TypeScript ho
 
   let { value, onChange }: { value: Trigger; onChange: (t: Trigger) => void } = $props();
 
+  import { inputLabel } from "../types";
+
   // Subset of keys we expose in the dropdown. Live capture lands in Plan 3b.
   const KEY_OPTIONS: KeyCode[] = [
-    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-    "Num0", "Num1", "Num2", "Num3", "Num4", "Num5",
-    "Num6", "Num7", "Num8", "Num9",
-    "Space", "Enter", "Tab", "Escape",
-    "Up", "Down", "Left", "Right",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "num0", "num1", "num2", "num3", "num4",
+    "num5", "num6", "num7", "num8", "num9",
+    "space", "enter", "tab", "escape",
+    "up", "down", "left", "right",
   ];
-  const MODIFIERS: Modifier[] = ["Ctrl", "Shift", "Alt", "Win"];
+  const MODIFIERS: Modifier[] = ["ctrl", "shift", "alt", "win"];
 
   function toggle(mod: Modifier) {
     if (value.type !== "hotkey") return;
@@ -1898,13 +2079,13 @@ Move the import of `Trigger, PlaybackMode` to the top of the file (TypeScript ho
         checked={value.type === "hotkey" && value.modifiers.includes(mod)}
         onchange={() => toggle(mod)}
       />
-      {mod}
+      {inputLabel(mod)}
     </label>
   {/each}
 </div>
-<select onchange={changeKey} value={value.type === "hotkey" ? value.key : "F1"}>
+<select onchange={changeKey} value={value.type === "hotkey" ? value.key : "f1"}>
   {#each KEY_OPTIONS as k}
-    <option value={k}>{k}</option>
+    <option value={k}>{inputLabel(k)}</option>
   {/each}
 </select>
 
@@ -2095,7 +2276,7 @@ Replace the file with:
   let editing = $state<MacroDto | null>(null);
 
   function handlePlay(_id: string) {
-    // Wired up in Task 11.
+    // Wired up in Task 13.
   }
 
   function handleEdit(id: string) {
@@ -2155,42 +2336,53 @@ git commit -m "feat(app/ui): EditMetadataModal + HotkeyPicker (dropdown-based ho
 
 ---
 
-## Task 10: `play_macro` + `stop_playback` commands with `ActivePlayback` supervisor
+## Task 12: `play_macro` + `stop_playback` commands with `ActivePlayback` supervisor
 
 **Files:**
 - Modify: `crates/app/src/commands.rs`
 - Modify: `crates/app/src/main.rs`
 
-- [ ] **Step 1: Add the helper that opens the Interception driver lazily**
+- [ ] **Step 1: Add the helper that opens the Interception driver lazily (feature-gated)**
 
 In `crates/app/src/commands.rs`, near the top (after the `use` block), add:
 
 ```rust
-use rm_driver::{Driver, DriverHub};
-use rm_driver_interception::{detect_status, DriverStatus, InterceptionDriver};
 use std::sync::Arc;
 
-fn open_interception() -> Result<Arc<dyn Driver>, AppError> {
-    InterceptionDriver::new()
-        .map(|d| Arc::new(d) as Arc<dyn Driver>)
-        .map_err(|orig| match detect_status() {
-            DriverStatus::NotInstalled => AppError::DriverNotInstalled,
-            DriverStatus::InstalledNotRunning => AppError::DriverNotRunning,
-            DriverStatus::Running => AppError::DriverIo(orig.to_string()),
-        })
+#[cfg(feature = "interception")]
+mod driver_init {
+    use super::*;
+    use rm_driver::{Driver, DriverHub};
+    use rm_driver_interception::open_with_status;
+    use std::sync::Arc;
+
+    pub async fn ensure_hub(state: &AppState) -> Result<Arc<DriverHub>, AppError> {
+        let mut guard = state.driver_hub.lock().await;
+        if let Some(h) = guard.as_ref() {
+            return Ok(h.clone());
+        }
+        let drv: Arc<dyn Driver> = Arc::new(open_with_status()?);
+        let hub = DriverHub::start(drv);
+        *guard = Some(hub.clone());
+        Ok(hub)
+    }
 }
 
-async fn ensure_hub(state: &AppState) -> Result<Arc<DriverHub>, AppError> {
-    let mut guard = state.driver_hub.lock().await;
-    if let Some(h) = guard.as_ref() {
-        return Ok(h.clone());
+#[cfg(not(feature = "interception"))]
+mod driver_init {
+    use super::*;
+    use rm_driver::DriverHub;
+    use std::sync::Arc;
+
+    pub async fn ensure_hub(_state: &AppState) -> Result<Arc<DriverHub>, AppError> {
+        Err(AppError::DriverNotInstalled)
     }
-    let drv = open_interception()?;
-    let hub = DriverHub::start(drv);
-    *guard = Some(hub.clone());
-    Ok(hub)
 }
+
+use driver_init::ensure_hub;
 ```
+
+Note: `rm_driver_interception::open_with_status` is the shared helper added in Task 3. The non-feature stub returns `DriverNotInstalled` so the GUI surfaces the same toast as a missing driver and stays read-only — matching the LGPL opt-out promised by the `interception` feature flag.
 
 - [ ] **Step 2: Add the `play_macro` and `stop_playback` command bodies**
 
@@ -2210,14 +2402,18 @@ struct PlaybackStartedEvent {
 #[derive(Serialize, Clone)]
 struct PlaybackFinishedEvent {
     macro_id: Uuid,
-    result: PlaybackResult,
+    outcome: PlaybackOutcome,
 }
 
 #[derive(Serialize, Clone)]
-#[serde(untagged)]
-enum PlaybackResult {
-    Ok { ok: bool },
-    Err(WireError),
+#[serde(tag = "status", rename_all = "snake_case")]
+enum PlaybackOutcome {
+    /// Macro ran to completion normally.
+    Ok,
+    /// User clicked Stop (or another stop_playback call took the slot).
+    Stopped,
+    /// Player returned an error.
+    Failed { error: WireError },
 }
 
 #[tauri::command]
@@ -2247,60 +2443,64 @@ pub async fn play_macro(
     let macro_id = m.id;
     let macro_name = m.name.clone();
 
-    // Spawn the player. The task itself is responsible for emitting
-    // `playback_finished` on natural completion AND for clearing the
-    // active slot. `stop_playback` (below) aborts this task — when aborted,
-    // the cleanup code below DOES NOT run, so `stop_playback` is responsible
-    // for emitting `playback_finished` and clearing the slot in that case.
-    let app_for_task = app.clone();
-    let macro_name_for_task = macro_name.clone();
-    let join = tokio::spawn(async move {
-        let result = play(hub, m).wait().await;
+    // The slot's `stop_tx` is what `stop_playback` fires when the user clicks
+    // Stop. A small relay records the user-initiated flag (so we can map the
+    // player's clean exit to `PlaybackOutcome::Stopped` rather than `Ok`) and
+    // forwards the signal to `PlaybackHandle::run_with_stop`, which calls the
+    // handle's internal `stop()` and awaits the player's clean exit between
+    // steps. No tasks are aborted; no players run detached.
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped_for_signal = stopped.clone();
+    let (inner_stop_tx, inner_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        if stop_rx.await.is_ok() {
+            stopped_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = inner_stop_tx.send(());
+        }
+    });
 
-        // Cleanup: clear active slot and emit. Re-acquire AppState via the
-        // AppHandle so we don't have to capture a 'static reference.
+    let app_for_task = app.clone();
+    tokio::spawn(async move {
+        let handle = play(hub, m);
+        let result = handle.run_with_stop(inner_stop_rx).await;
+        let outcome = match (result, stopped.load(std::sync::atomic::Ordering::SeqCst)) {
+            (Ok(()), true) => PlaybackOutcome::Stopped,
+            (Ok(()), false) => PlaybackOutcome::Ok,
+            (Err(e), _) => PlaybackOutcome::Failed { error: e.to_wire() },
+        };
+
+        // Cleanup: clear active slot if we're still the active playback.
+        // Re-acquire AppState via the AppHandle so we don't capture a
+        // 'static reference.
         if let Some(s) = app_for_task.try_state::<AppState>() {
             let mut active = s.active.lock().await;
-            // Only clear if we are still the active playback — if
-            // stop_playback already took us out, leave it alone.
             if active.as_ref().map(|a| a.macro_id) == Some(macro_id) {
                 *active = None;
             }
         }
 
-        let payload = match &result {
-            Ok(()) => PlaybackResult::Ok { ok: true },
-            Err(e) => PlaybackResult::Err(e.to_wire()),
-        };
         let _ = app_for_task.emit(
             "playback_finished",
-            PlaybackFinishedEvent { macro_id, result: payload },
+            PlaybackFinishedEvent { macro_id, outcome },
         );
-
-        // Suppress unused warning — name carried for diagnostic use only.
-        let _ = macro_name_for_task;
-
-        result
     });
 
-    let abort_handle = join.abort_handle();
-
-    // Store the active playback. We deliberately do NOT keep `join` — the
-    // task owns its own completion path. Aborting via `abort_handle` is
-    // the only external lever.
+    // Store the active playback. The supervisor task above owns the player.
+    // `stop_playback` takes `stop_tx` out of the slot and fires it; the
+    // supervisor handles the rest.
     {
         let mut active = state.active.lock().await;
         *active = Some(ActivePlayback {
             macro_id,
             macro_name: macro_name.clone(),
-            abort_handle,
+            stop_tx: Some(stop_tx),
         });
     }
 
     // Emit playback_started after the active slot is populated, so any
     // frontend handler that immediately calls `stop_playback` sees a
-    // consistent state. If emit fails (no window), log and continue —
-    // the playback runs independently of the UI signal.
+    // consistent state.
     let _ = app.emit(
         "playback_started",
         PlaybackStartedEvent { macro_id, macro_name },
@@ -2311,32 +2511,19 @@ pub async fn play_macro(
 
 #[tauri::command]
 pub async fn stop_playback(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), WireError> {
-    let taken = {
-        let mut active = state.active.lock().await;
-        active.take()
-    };
-    let Some(ap) = taken else { return Ok(()); };
-
-    // Abort the player task. rm_player::play does not yet expose a cooperative
-    // stop hook reachable from the GUI; cancelling at the next await point is
-    // the pragmatic v1 stop. The hub remains valid and reusable.
-    ap.abort_handle.abort();
-
-    // The aborted task's cleanup branch will not run, so we are responsible
-    // for emitting `playback_finished` ourselves. The active slot has
-    // already been cleared above.
-    let _ = app.emit(
-        "playback_finished",
-        PlaybackFinishedEvent {
-            macro_id: ap.macro_id,
-            result: PlaybackResult::Err(
-                AppError::Other("stopped by user".into()).to_wire(),
-            ),
-        },
-    );
+    // Send the cooperative stop signal. The supervisor task spawned by
+    // `play_macro` will observe it, call `PlaybackHandle::run_with_stop`'s
+    // internal `stop()`, await the player's clean exit, clear the active
+    // slot, and emit `playback_finished` with `outcome: stopped`.
+    let mut active = state.active.lock().await;
+    if let Some(ap) = active.as_mut() {
+        if let Some(tx) = ap.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
     Ok(())
 }
 ```
@@ -2372,17 +2559,13 @@ In `crates/app/src/commands.rs`'s `mod tests`, append:
         // Simulate that a playback is in progress by placing a dummy in the
         // active slot. The macro_id/name don't matter — we only care about
         // the guard returning PlaybackActive.
-        let dummy_join = tokio::spawn(async { Ok::<(), AppError>(()) });
-        let abort_handle = dummy_join.abort_handle();
-        // We don't await dummy_join — it returns immediately and the
-        // JoinHandle is dropped at end of scope.
-        let _ = dummy_join;
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
         {
             let mut active = state.active.lock().await;
             *active = Some(crate::state::ActivePlayback {
                 macro_id: Uuid::new_v4(),
                 macro_name: "x".into(),
-                abort_handle,
+                stop_tx: Some(tx),
             });
         }
         // The guard in play_macro is a simple `if active.is_some()` block;
@@ -2412,7 +2595,7 @@ git commit -m "feat(app): play_macro/stop_playback with lazy DriverHub + ActiveP
 
 ---
 
-## Task 11: Frontend — playback store + `PlaybackBanner` + event listeners
+## Task 13: Frontend — playback store + `PlaybackBanner` + event listeners
 
 **Files:**
 - Create: `crates/app/ui/src/lib/stores/playback.ts`
@@ -2425,7 +2608,6 @@ git commit -m "feat(app): play_macro/stop_playback with lazy DriverHub + ActiveP
 import { writable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { WireError } from "../types";
-import { isWireError } from "../types";
 import * as api from "../api";
 import { reportError, pushToast } from "./toast";
 
@@ -2438,7 +2620,12 @@ export type ActivePlayback = {
 export const active = writable<ActivePlayback | null>(null);
 
 type StartedPayload = { macro_id: string; macro_name: string };
-type FinishedPayload = { macro_id: string; result: { ok: true } | WireError };
+type FinishedOutcome =
+  | { status: "ok" }
+  | { status: "stopped" }
+  | { status: "failed"; error: WireError };
+
+type FinishedPayload = { macro_id: string; outcome: FinishedOutcome };
 
 let unlisteners: UnlistenFn[] = [];
 
@@ -2458,11 +2645,17 @@ export async function startListening(): Promise<void> {
 
   unlisteners.push(
     await listen<FinishedPayload>("playback_finished", (event) => {
-      const { result } = event.payload;
-      if (isWireError(result)) {
-        pushToast("warning", `Playback stopped: ${result.message}`);
-      } else {
-        pushToast("success", "Playback finished.");
+      const { outcome } = event.payload;
+      switch (outcome.status) {
+        case "ok":
+          pushToast("success", "Playback finished.");
+          break;
+        case "stopped":
+          pushToast("info", "Playback stopped.");
+          break;
+        case "failed":
+          pushToast("error", `Playback failed: ${outcome.error.message}`);
+          break;
       }
       active.set(null);
     }),
@@ -2646,7 +2839,7 @@ git commit -m "feat(app/ui): playback store + PlaybackBanner + Tauri event liste
 
 ---
 
-## Task 12: README + manual smoke test plan
+## Task 14: README + manual smoke test plan
 
 **Files:**
 - Create: `crates/app/README.md`
@@ -2709,9 +2902,14 @@ Before merging, the implementer should walk through:
    restarting the app shows the persisted change.
 4. **Delete.** Click ✕, confirm. The row disappears. Restart the app — still
    gone.
-5. **Play (no driver).** With Interception NOT installed, click ▶. A
-   persistent error toast appears: "Interception driver not installed…".
-   The list and banner are otherwise unchanged.
+5. **Play (driver missing).** This step requires the implementer to either
+   not have Interception installed, or temporarily build with
+   `cargo tauri dev --no-default-features` (which disables the
+   `interception` feature). Without the feature, every Play click should
+   produce a persistent error toast: "Interception driver not installed…".
+   With the feature on but no driver, same toast. **If you have Interception
+   installed and won't uninstall it for the test, skip this step and note
+   it as "deferred to CI smoke once we have one".**
 6. **Play (with driver).** With Interception installed and running, click ▶
    on a macro. The PlaybackBanner appears. Playback executes against the OS.
    When it finishes, a green "Playback finished" toast appears and the banner
@@ -2748,12 +2946,12 @@ git commit -m "docs(app): Plan 3a README with dev setup + manual smoke test plan
 
 ---
 
-## Task 13: Final verification
+## Task 15: Final verification
 
 - [ ] **Step 1: All workspace tests pass**
 
 Run: `cargo test --workspace --no-fail-fast`
-Expected: PASS — 76 from before + new tests from `rm-app` (≈11 — 5 dto + 5 commands + 1 state guard).
+Expected: PASS — 76 from before + 1 new in `rm-player` (run_with_stop) + new tests from `rm-app` (≈10 — 5 dto + 4 commands + 1 state guard).
 
 - [ ] **Step 2: Frontend builds**
 
@@ -2790,7 +2988,7 @@ The previous tasks committed all changes. This task is acceptance-only.
 
 ## Acceptance Checklist (from the spec)
 
-- [ ] `cargo test --workspace` is green (76 prior + ~11 new).
+- [ ] `cargo test --workspace` is green (76 prior + 1 new in `rm-player` + ~10 new in `rm-app`).
 - [ ] `cargo build -p rm-app` succeeds on Windows.
 - [ ] `cargo tauri dev` opens a working window.
 - [ ] Empty-state, list-render, edit, delete, and PlaybackActive guard all
@@ -2807,7 +3005,7 @@ The previous tasks committed all changes. This task is acceptance-only.
 - **Tauri 2 + Svelte 5 template drift.** If the official `create-tauri-app`
   scaffolder still emits Svelte 4 at implementation time, the
   `crates/app/ui/package.json` versions in this plan force Svelte 5. The
-  `mount()` API in Task 4's `main.ts` and the rune syntax (`$state`,
+  `mount()` API in Task 6's `main.ts` and the rune syntax (`$state`,
   `$props`, `$effect`) in components require Svelte 5. If the implementer
   hits a runtime error like `mount is not a function`, the most likely
   cause is that npm resolved Svelte 4 — verify with `npm ls svelte` and
@@ -2817,24 +3015,28 @@ The previous tasks committed all changes. This task is acceptance-only.
   implementer's clipboard or autocomplete fills in the v1 path
   `@tauri-apps/api/tauri`, it will fail at runtime with "module not
   found" — the fix is to use `@tauri-apps/api/core`.
-- **Tauri `Emitter` trait.** Task 10's `app.emit(...)` requires
+- **Tauri `Emitter` trait.** Task 12's `app.emit(...)` requires
   `use tauri::Emitter;` in Tauri 2 (the trait method is not implicitly
   on `AppHandle`). This is included in the plan; if it's missed, the
   compile error is clear ("no method named emit").
-- **`tauri::Manager` and `try_state`.** In Task 10's supervisor task,
+- **`tauri::Manager` and `try_state`.** In Task 12's supervisor task,
   `app.try_state::<AppState>()` requires `use tauri::Manager;` to be in
   scope. Add this with the other `use` statements in `commands.rs`. If
   missed, the compile error names the method correctly.
-- **Stop semantics.** Plan 3a's `stop_playback` uses `abort_handle.abort()`
-  because `rm_player::play` does not yet expose a cooperative stop signal
-  reachable from the GUI. This cancels at the next await point inside the
-  player loop, which means a `KeyDown` without a matching `KeyUp` is
-  theoretically possible (the OS may end up with a key still "pressed"
-  from the kernel's view). A future plan should thread a
-  `oneshot::Receiver<()>` into `rm_player::play` so we can stop
-  cooperatively and emit any pending KeyUps. v1 acceptance: macro is
-  stopped; whatever state the OS is in is acceptable for the kind of
-  workloads this app targets (single-player game automation).
+- **Stop semantics (resolved).** `stop_playback` sends on the slot's
+  `stop_tx`. A relay task observes this, records the user-initiated flag,
+  and forwards to `PlaybackHandle::run_with_stop` (added in Task 4 of this
+  plan). `run_with_stop` calls the handle's internal `stop()` then awaits
+  the player's clean exit between steps. The supervisor task then emits
+  `playback_finished` with `outcome: stopped`. No tasks are aborted; no
+  detached players. The Loop-mode "stop actually stops" guarantee is
+  exercised by `crates/player/src/lib.rs`'s new
+  `run_with_stop_signals_clean_exit` test.
+- **`open_with_status` extraction.** Plan 2b's CLI carries a private
+  `open_interception()` helper that maps `InterceptionDriver::new()`
+  failure to `AppError` via `detect_status()`. Task 3 of this plan
+  extracts that to `rm_driver_interception::open_with_status` so both
+  the CLI and the GUI use a single source of truth.
 - **Storage root.** `dirs::data_dir()` on Windows returns
   `%APPDATA%/Roaming`. The CLI uses the same path. If the implementer
   runs both the CLI and the GUI on the same machine, they share the
