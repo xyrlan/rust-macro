@@ -1,7 +1,12 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rm_driver::RawEvent;
 use rm_macro_model::{Point, Step};
+
+/// Minimum Wait duration that survives compilation. Sub-threshold gaps are
+/// dropped — humans don't perceive them, and they bloat step lists during
+/// dense input. If you need precise timing, edit the macro JSON directly.
+pub const MIN_WAIT_MS: u32 = 20;
 
 /// One raw event paired with its capture timestamp.
 #[derive(Debug, Clone)]
@@ -37,8 +42,8 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
         let cur = &raw[i];
         // Emit a Wait for the gap since the previously emitted step's end.
         let gap = cur.at.duration_since(last_at);
-        if gap >= Duration::from_millis(1) {
-            let ms = gap.as_millis().min(u32::MAX as u128) as u32;
+        let ms = gap.as_millis().min(u32::MAX as u128) as u32;
+        if ms >= MIN_WAIT_MS {
             out.push(Step::Wait {
                 min_ms: ms,
                 max_ms: ms,
@@ -135,6 +140,7 @@ fn duration_ms_between(a: Instant, b: Instant) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use rm_macro_model::{KeyCode, MouseButton};
 
     fn at(base: Instant, ms: u64) -> Instant {
@@ -375,6 +381,48 @@ mod tests {
                     key: KeyCode::B,
                     hold_ms: 100
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn waits_below_threshold_are_dropped() {
+        // Gap of 15ms between two key presses should be filtered.
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 50), RawEvent::KeyUp { key: KeyCode::A }),
+            ev(at(t0, 65), RawEvent::KeyDown { key: KeyCode::B }),
+            ev(at(t0, 115), RawEvent::KeyUp { key: KeyCode::B }),
+        ];
+        let steps = compile_events(&raw);
+        // 15ms gap dropped — adjacent KeyPresses, no Wait between.
+        assert_eq!(
+            steps,
+            vec![
+                Step::KeyPress { key: KeyCode::A, hold_ms: 50 },
+                Step::KeyPress { key: KeyCode::B, hold_ms: 50 },
+            ]
+        );
+    }
+
+    #[test]
+    fn waits_at_or_above_threshold_are_kept() {
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 50), RawEvent::KeyUp { key: KeyCode::A }),
+            ev(at(t0, 80), RawEvent::KeyDown { key: KeyCode::B }),
+            ev(at(t0, 130), RawEvent::KeyUp { key: KeyCode::B }),
+        ];
+        let steps = compile_events(&raw);
+        // 30ms gap kept.
+        assert_eq!(
+            steps,
+            vec![
+                Step::KeyPress { key: KeyCode::A, hold_ms: 50 },
+                Step::Wait { min_ms: 30, max_ms: 30 },
+                Step::KeyPress { key: KeyCode::B, hold_ms: 50 },
             ]
         );
     }
