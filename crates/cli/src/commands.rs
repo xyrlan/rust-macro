@@ -89,12 +89,7 @@ pub async fn cmd_play(root: &Path, name: &str, driver_kind: DriverKind) -> Resul
 
 #[cfg(feature = "interception")]
 fn open_interception() -> Result<rm_driver_interception::InterceptionDriver> {
-    use rm_driver_interception::{detect_status, DriverStatus, InterceptionDriver};
-    InterceptionDriver::new().map_err(|orig| match detect_status() {
-        DriverStatus::NotInstalled => AppError::DriverNotInstalled,
-        DriverStatus::InstalledNotRunning => AppError::DriverNotRunning,
-        DriverStatus::Running => AppError::DriverIo(orig.to_string()),
-    })
+    rm_driver_interception::open_with_status()
 }
 
 pub fn cmd_list(root: &Path) -> Result<()> {

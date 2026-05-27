@@ -13,6 +13,7 @@ smoke = []
 async-trait.workspace = true
 kanata-interception.workspace = true
 rm-driver = { path = "../driver" }
+rm-error = { path = "../error" }
 rm-macro-model = { path = "../macro_model" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }

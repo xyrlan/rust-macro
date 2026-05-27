@@ -11,6 +11,19 @@ pub mod status;
 pub use driver::InterceptionDriver;
 pub use status::{detect_status, DriverStatus};
 
+use rm_error::AppError;
+
+/// Open an Interception context, mapping failure to `AppError` via
+/// `detect_status()`. Consumers (CLI, GUI) should prefer this over
+/// `InterceptionDriver::new()` + manual status mapping.
+pub fn open_with_status() -> Result<InterceptionDriver, AppError> {
+    InterceptionDriver::new().map_err(|orig| match detect_status() {
+        DriverStatus::NotInstalled => AppError::DriverNotInstalled,
+        DriverStatus::InstalledNotRunning => AppError::DriverNotRunning,
+        DriverStatus::Running => AppError::DriverIo(orig.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod sanity {
     use rm_driver::RawEvent;
