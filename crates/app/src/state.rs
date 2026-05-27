@@ -17,6 +17,7 @@ pub struct AppState {
     pub active: Mutex<Option<ActivePlayback>>,
     pub recording: Mutex<Option<ActiveRecording>>,
     pub settings: Mutex<crate::settings::Settings>,
+    pub pending_reboot: Mutex<bool>,
     #[cfg(feature = "interception")]
     pub listener: Mutex<Option<crate::listener::ActiveListener>>,
 }
@@ -37,13 +38,14 @@ pub struct ActiveRecording {
 }
 
 impl AppState {
-    pub fn new(storage_root: PathBuf, settings: crate::settings::Settings) -> Self {
+    pub fn new(storage_root: PathBuf, settings: crate::settings::Settings, pending_reboot: bool) -> Self {
         Self {
             storage_root,
             driver_hub: Mutex::new(None),
             active: Mutex::new(None),
             recording: Mutex::new(None),
             settings: Mutex::new(settings),
+            pending_reboot: Mutex::new(pending_reboot),
             #[cfg(feature = "interception")]
             listener: Mutex::new(None),
         }

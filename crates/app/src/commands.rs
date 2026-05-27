@@ -440,6 +440,27 @@ pub async fn save_settings(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn driver_status(state: State<'_, AppState>) -> Result<crate::dto::DriverStateDto, WireError> {
+    #[cfg(feature = "interception")]
+    let status: crate::dto::DriverStatusDto = rm_driver_interception::detect_status().into();
+    #[cfg(not(feature = "interception"))]
+    let status = crate::dto::DriverStatusDto::NotInstalled;
+
+    let pending_reboot = *state.pending_reboot.lock().await;
+
+    // If the driver is now Running, the reboot took effect — clear the flag
+    // in the returned response (file marker cleared elsewhere; this surface
+    // value just doesn't propagate a stale "pending" past success).
+    let pending_reboot = if matches!(status, crate::dto::DriverStatusDto::Running) {
+        false
+    } else {
+        pending_reboot
+    };
+
+    Ok(crate::dto::DriverStateDto { status, pending_reboot })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +470,7 @@ mod tests {
 
     fn fixture_state() -> (TempDir, AppState) {
         let tmp = TempDir::new().unwrap();
-        let state = AppState::new(tmp.path().to_path_buf(), crate::settings::Settings::default());
+        let state = AppState::new(tmp.path().to_path_buf(), crate::settings::Settings::default(), false);
         (tmp, state)
     }
 

@@ -214,6 +214,31 @@ impl From<SettingsDto> for crate::settings::Settings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverStatusDto {
+    NotInstalled,
+    InstalledNotRunning,
+    Running,
+}
+
+#[cfg(feature = "interception")]
+impl From<rm_driver_interception::DriverStatus> for DriverStatusDto {
+    fn from(s: rm_driver_interception::DriverStatus) -> Self {
+        match s {
+            rm_driver_interception::DriverStatus::NotInstalled => DriverStatusDto::NotInstalled,
+            rm_driver_interception::DriverStatus::InstalledNotRunning => DriverStatusDto::InstalledNotRunning,
+            rm_driver_interception::DriverStatus::Running => DriverStatusDto::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DriverStateDto {
+    pub status: DriverStatusDto,
+    pub pending_reboot: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

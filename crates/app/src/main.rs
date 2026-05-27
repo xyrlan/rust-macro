@@ -18,6 +18,10 @@ use std::path::PathBuf;
 
 use state::AppState;
 
+fn read_pending_reboot(storage_root: &std::path::Path) -> bool {
+    storage_root.join(".driver-install-pending").exists()
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -38,8 +42,10 @@ fn main() {
         settings::Settings::default()
     });
 
+    let pending_reboot = read_pending_reboot(&storage_root);
+
     let builder = tauri::Builder::default()
-        .manage(AppState::new(storage_root, settings))
+        .manage(AppState::new(storage_root, settings, pending_reboot))
         .invoke_handler(tauri::generate_handler![
             commands::load_macros,
             commands::delete_macro,
@@ -53,6 +59,7 @@ fn main() {
             commands::stop_recording,
             commands::load_settings,
             commands::save_settings,
+            commands::driver_status,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
