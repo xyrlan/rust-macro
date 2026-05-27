@@ -41,6 +41,27 @@ fn main() {
             commands::start_recording,
             commands::stop_recording,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // If a recording is active, fire its stop signal so the
+                // supervisor finalizes cleanly (drops the Interception
+                // context). We don't block close on completion — the
+                // OS will reap any orphaned task on exit, and Interception
+                // releases on context drop.
+                use tauri::Manager;
+                let app_handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(s) = app_handle.try_state::<AppState>() {
+                        let mut recording = s.recording.lock().await;
+                        if let Some(ar) = recording.as_mut() {
+                            if let Some(tx) = ar.stop_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                });
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
