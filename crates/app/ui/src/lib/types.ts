@@ -62,6 +62,41 @@ export type WireError = {
   message: string;
 };
 
+export type PointDto = { x: number; y: number };
+
+export type MoveModeDto = "absolute" | "relative";
+
+export type MouseButton = "left" | "right" | "middle" | "x1" | "x2";
+
+export type StepDto =
+  | { type: "key_press"; key: KeyCode; hold_ms: number }
+  | { type: "key_down"; key: KeyCode }
+  | { type: "key_up"; key: KeyCode }
+  | { type: "mouse_click"; button: MouseButton; hold_ms: number; at: PointDto | null }
+  | { type: "mouse_move"; to: PointDto; mode: MoveModeDto }
+  | { type: "mouse_scroll"; delta: number }
+  | { type: "wait"; min_ms: number; max_ms: number };
+
+/** Defaults for the editor's "+ Add step" picker. Keep in sync with Plan 3b
+ *  Task 15's defaults table. */
+export const STEP_DEFAULTS: Record<StepDto["type"], () => StepDto> = {
+  key_press: () => ({ type: "key_press", key: "a", hold_ms: 50 }),
+  key_down: () => ({ type: "key_down", key: "a" }),
+  key_up: () => ({ type: "key_up", key: "a" }),
+  mouse_click: () => ({ type: "mouse_click", button: "left", hold_ms: 50, at: null }),
+  mouse_move: () => ({ type: "mouse_move", to: { x: 0, y: 0 }, mode: "relative" }),
+  mouse_scroll: () => ({ type: "mouse_scroll", delta: 0 }),
+  wait: () => ({ type: "wait", min_ms: 100, max_ms: 100 }),
+};
+
+/** Human-readable label for the step type. */
+export function stepLabel(type: StepDto["type"]): string {
+  return type
+    .split("_")
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+}
+
 export function isWireError(e: unknown): e is WireError {
   return (
     typeof e === "object" &&
