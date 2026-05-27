@@ -111,6 +111,15 @@ pub async fn update_macro_metadata(
     Ok(MacroDto::from(&m))
 }
 
+#[tauri::command]
+pub async fn load_macro_steps(
+    state: State<'_, AppState>,
+    id: Uuid,
+) -> Result<Vec<crate::dto::StepDto>, WireError> {
+    let m = load_macro(&state.storage_root, id).map_err(|e| e.to_wire())?;
+    Ok(m.steps.iter().map(crate::dto::StepDto::from).collect())
+}
+
 use crate::state::ActivePlayback;
 use rm_player::play;
 use serde::Serialize;
@@ -433,6 +442,25 @@ mod tests {
             Trigger::Hotkey { key: KeyCode::F5, .. }));
         assert!(matches!(reloaded.playback, PlaybackMode::Repeat { count: 3 }));
         assert_eq!(reloaded.steps.len(), 1); // steps preserved
+    }
+
+    #[tokio::test]
+    async fn load_macro_steps_returns_dtos() {
+        let (_tmp, state) = fixture_state();
+        let mut m = fixture_macro("with-steps");
+        m.steps = vec![
+            Step::KeyPress { key: KeyCode::A, hold_ms: 80 },
+            Step::Wait { min_ms: 50, max_ms: 50 },
+            Step::KeyPress { key: KeyCode::B, hold_ms: 80 },
+        ];
+        save_macro(&state.storage_root, &m).unwrap();
+
+        // Mirror the command body:
+        let loaded = load_macro(&state.storage_root, m.id).unwrap();
+        let dtos: Vec<crate::dto::StepDto> = loaded.steps.iter().map(crate::dto::StepDto::from).collect();
+        assert_eq!(dtos.len(), 3);
+        assert!(matches!(dtos[0], crate::dto::StepDto::KeyPress { .. }));
+        assert!(matches!(dtos[1], crate::dto::StepDto::Wait { .. }));
     }
 
     #[tokio::test]
