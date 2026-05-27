@@ -6,7 +6,13 @@
 // debug so println!/tracing output is visible during development.
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+mod commands;
 mod dto;
+mod state;
+
+use std::path::PathBuf;
+
+use state::AppState;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -16,7 +22,16 @@ fn main() {
         )
         .init();
 
+    let storage_root = dirs::data_dir()
+        .map(|d| d.join("rust-macro"))
+        .unwrap_or_else(|| PathBuf::from("./.rust-macro"));
+
     tauri::Builder::default()
+        .manage(AppState::new(storage_root))
+        .invoke_handler(tauri::generate_handler![
+            commands::load_macros,
+            commands::delete_macro,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
