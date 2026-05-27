@@ -59,6 +59,10 @@ pub fn spawn_supervisor(
         if let Some(s) = app.try_state::<AppState>() {
             let mut recording = s.recording.lock().await;
             *recording = None;
+        } else {
+            tracing::error!(
+                "recording supervisor: AppState not registered — recording slot may be stuck"
+            );
         }
 
         let _ = app.emit(

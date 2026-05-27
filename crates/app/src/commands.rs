@@ -270,13 +270,6 @@ pub async fn start_recording(
             return Err(AppError::PlaybackActive.to_wire());
         }
     }
-    // Reject if a recording is already in progress.
-    {
-        let recording = state.recording.lock().await;
-        if recording.is_some() {
-            return Err(AppError::RecordingActive.to_wire());
-        }
-    }
 
     // Open a fresh per-session hub (NOT the lazy playback hub).
     let hub = open_fresh_hub().map_err(|e| e.to_wire())?;
@@ -292,10 +285,14 @@ pub async fn start_recording(
     // window-close handler).
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Reserve the recording slot. Clone hub into the slot so it lives as
-    // long as the recording; the supervisor task also keeps a strong ref.
+    // Reserve the recording slot atomically: check + write under one lock.
+    // If another start_recording call won the race, we return early; the
+    // local hub and handle are dropped here, releasing Interception cleanly.
     {
         let mut recording = state.recording.lock().await;
+        if recording.is_some() {
+            return Err(AppError::RecordingActive.to_wire());
+        }
         *recording = Some(ActiveRecording {
             stop_tx: Some(stop_tx),
             session_hub: hub.clone(),
