@@ -19,7 +19,6 @@ interception = ["dep:rm-driver-interception"]
 tauri-build.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 rm-driver = { path = "../driver" }
