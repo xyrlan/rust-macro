@@ -1,0 +1,7 @@
+[package]
+name = "rm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Stub created by Task 2 to unblock workspace resolution; full scaffold in Task 5.
