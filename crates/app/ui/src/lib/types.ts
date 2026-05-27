@@ -111,6 +111,13 @@ export function stepLabel(type: StepDto["type"]): string {
     .join(" ");
 }
 
+export type DriverStatusDto = "not_installed" | "installed_not_running" | "running";
+
+export type DriverStateDto = {
+  status: DriverStatusDto;
+  pending_reboot: boolean;
+};
+
 export function isWireError(e: unknown): e is WireError {
   return (
     typeof e === "object" &&
