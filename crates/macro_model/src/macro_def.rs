@@ -54,6 +54,10 @@ pub enum Trigger {
         key: KeyCode,
         modifiers: Vec<Modifier>,
     },
+    MouseButton {
+        button: MouseButton,
+        modifiers: Vec<Modifier>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -243,5 +247,33 @@ mod tests {
         assert!(j.contains("\"count\":5"));
         let back: PlaybackMode = serde_json::from_str(&j).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn trigger_mouse_button_serde_roundtrip() {
+        let t = Trigger::MouseButton {
+            button: MouseButton::X1,
+            modifiers: vec![Modifier::Ctrl],
+        };
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(j.contains("\"type\":\"mouse_button\""));
+        assert!(j.contains("\"button\":\"x1\""));
+        let back: Trigger = serde_json::from_str(&j).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn legacy_hotkey_trigger_still_parses() {
+        // Vintage 3a/3b on-disk format. Must continue to load after the
+        // MouseButton variant is added.
+        let j = r#"{"type":"hotkey","key":"f1","modifiers":["ctrl"]}"#;
+        let back: Trigger = serde_json::from_str(j).unwrap();
+        assert_eq!(
+            back,
+            Trigger::Hotkey {
+                key: KeyCode::F1,
+                modifiers: vec![Modifier::Ctrl],
+            }
+        );
     }
 }
