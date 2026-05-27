@@ -16,7 +16,13 @@ pub struct TimedEvent {
 ///     happens between, the events are kept as raw `KeyDown` / `KeyUp` — this
 ///     is the honest representation for overlapping inputs.
 ///   * Same rule for `MouseDown(b) → MouseUp(b)`.
-///   * `MouseMove` events become `Step::MouseMove { mode: Relative, to: dxdy }`.
+///   * **Consecutive `MouseMove` events coalesce** into a single
+///     `Step::MouseMove { mode: Relative, to: sum(dx), sum(dy) }`. The kernel
+///     can deliver hundreds of MouseMove events per second; without this,
+///     a one-second drag would produce hundreds of steps. Coalescing breaks
+///     on any non-MouseMove event (key, click, wheel). The time consumed by
+///     the motion run is dropped on the floor — replay teleports to the
+///     destination instantly.
 ///   * `MouseWheel` becomes `Step::MouseScroll`.
 ///   * Inter-event gaps become `Step::Wait { min_ms: gap, max_ms: gap }`.
 ///   * Lone / orphan key/mouse-up events emit a literal `Step::KeyUp` etc.
@@ -86,10 +92,29 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
                 // MouseDown when adjacent; orphans imply caller noise.)
             }
             RawEvent::MouseMove { dx, dy } => {
+                // Coalesce this MouseMove and all immediately following
+                // MouseMoves into one step with summed deltas.
+                let mut total_dx: i32 = dx;
+                let mut total_dy: i32 = dy;
+                let mut j = i + 1;
+                while let Some(next) = raw.get(j) {
+                    if let RawEvent::MouseMove { dx: ndx, dy: ndy } = next.event {
+                        total_dx = total_dx.saturating_add(ndx);
+                        total_dy = total_dy.saturating_add(ndy);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
                 out.push(Step::MouseMove {
-                    to: Point { x: dx, y: dy },
+                    to: Point { x: total_dx, y: total_dy },
                     mode: rm_macro_model::MoveMode::Relative,
                 });
+                // Advance past the entire run; last_at is the last consumed
+                // move so the next Wait reflects time-since-motion-ended.
+                last_at = raw[j - 1].at;
+                i = j;
+                continue;
             }
             RawEvent::MouseWheel { delta } => {
                 out.push(Step::MouseScroll { delta });
@@ -270,6 +295,56 @@ mod tests {
                     max_ms: 50
                 },
                 Step::KeyUp { key: KeyCode::B },
+            ]
+        );
+    }
+
+    #[test]
+    fn consecutive_mouse_moves_coalesce_summing_deltas() {
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::MouseMove { dx: 5, dy: 0 }),
+            ev(at(t0, 4), RawEvent::MouseMove { dx: 3, dy: 2 }),
+            ev(at(t0, 8), RawEvent::MouseMove { dx: -1, dy: 4 }),
+            ev(at(t0, 12), RawEvent::MouseMove { dx: 10, dy: -3 }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::MouseMove {
+                to: Point { x: 17, y: 3 },
+                mode: rm_macro_model::MoveMode::Relative,
+            }]
+        );
+    }
+
+    #[test]
+    fn mouse_move_runs_break_on_non_move_event() {
+        // Move, Move, KeyDown, Move → two coalesced runs with the key between.
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::MouseMove { dx: 5, dy: 0 }),
+            ev(at(t0, 5), RawEvent::MouseMove { dx: 3, dy: 0 }),
+            ev(at(t0, 50), RawEvent::KeyDown { key: KeyCode::A }),
+            ev(at(t0, 100), RawEvent::KeyUp { key: KeyCode::A }),
+            ev(at(t0, 200), RawEvent::MouseMove { dx: -2, dy: 4 }),
+            ev(at(t0, 205), RawEvent::MouseMove { dx: 1, dy: 1 }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![
+                Step::MouseMove {
+                    to: Point { x: 8, y: 0 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                },
+                Step::Wait { min_ms: 45, max_ms: 45 },
+                Step::KeyPress { key: KeyCode::A, hold_ms: 50 },
+                Step::Wait { min_ms: 100, max_ms: 100 },
+                Step::MouseMove {
+                    to: Point { x: -1, y: 5 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                },
             ]
         );
     }
