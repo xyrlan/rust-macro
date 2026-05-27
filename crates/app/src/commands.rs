@@ -469,7 +469,23 @@ fn resource_path_or_err(app: &AppHandle, rel: &str) -> Result<std::path::PathBuf
         .path()
         .resource_dir()
         .map_err(|e| AppError::Other(format!("resource_dir lookup: {e}")))?;
-    Ok(resource_dir.join(rel))
+    let primary = resource_dir.join(rel);
+    if primary.exists() {
+        return Ok(primary);
+    }
+    // Dev-mode fallback: `cargo tauri dev` doesn't materialize bundle.resources
+    // into resource_dir, so look relative to CARGO_MANIFEST_DIR
+    // (`crates/app/`). Production bundles always hit the primary path above.
+    #[cfg(debug_assertions)]
+    {
+        let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        if dev.exists() {
+            return Ok(dev);
+        }
+    }
+    // Return the primary (non-existent) path so the caller's exists() check
+    // surfaces the expected "installer not bundled at <path>" error.
+    Ok(primary)
 }
 
 #[tauri::command]
