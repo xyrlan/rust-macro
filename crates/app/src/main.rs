@@ -32,6 +32,8 @@ fn main() {
             commands::load_macros,
             commands::delete_macro,
             commands::update_macro_metadata,
+            commands::play_macro,
+            commands::stop_playback,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
