@@ -22,15 +22,29 @@ export type KeyCode =
 
 export type Modifier = "ctrl" | "shift" | "alt" | "win";
 
-/** Format a snake_case KeyCode/Modifier for display. */
-export function inputLabel(s: KeyCode | Modifier): string {
+/** Format a snake_case KeyCode/Modifier/MouseButton for display. */
+export function inputLabel(s: string): string {
   return s
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 }
 
-export type Trigger = { type: "hotkey"; key: KeyCode; modifiers: Modifier[] };
+export type Trigger =
+  | { type: "hotkey"; key: KeyCode; modifiers: Modifier[] }
+  | { type: "mouse_button"; button: MouseButton; modifiers: Modifier[] };
+
+export type SettingsDto = {
+  stop_key: KeyCode;
+  storage_root_override: string | null;
+};
+
+/** Human-readable label for a Trigger. */
+export function triggerLabel(t: Trigger): string {
+  const mods = t.modifiers.map(inputLabel).join("+");
+  const tail = t.type === "hotkey" ? inputLabel(t.key) : `Mouse:${inputLabel(t.button)}`;
+  return mods ? `${mods}+${tail}` : tail;
+}
 
 export type PlaybackMode =
   | { type: "once" }
