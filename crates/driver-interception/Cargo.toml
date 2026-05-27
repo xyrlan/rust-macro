@@ -1,0 +1,23 @@
+[package]
+name = "rm-driver-interception"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Gates the live-driver smoke tests in tests/smoke.rs (require Interception
+# installed on the host). Unit tests for the pure-Rust mapping logic always run.
+smoke = []
+
+[dependencies]
+async-trait.workspace = true
+kanata-interception.workspace = true
+rm-driver = { path = "../driver" }
+rm-macro-model = { path = "../macro_model" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
