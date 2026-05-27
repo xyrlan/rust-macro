@@ -1,5 +1,5 @@
 import { writable, get } from "svelte/store";
-import type { MacroDto } from "../types";
+import type { MacroDto, Trigger, PlaybackMode } from "../types";
 import * as api from "../api";
 import { reportError } from "./toast";
 
@@ -26,6 +26,20 @@ export async function remove(id: string): Promise<void> {
     reportError(e);
     // The macro may have been deleted externally — reload to converge.
     await loadAll();
+  }
+}
+
+export async function updateMetadata(
+  id: string,
+  name: string,
+  trigger: Trigger,
+  playback: PlaybackMode,
+): Promise<void> {
+  try {
+    const updated = await api.updateMacroMetadata(id, name, trigger, playback);
+    macros.update((list) => list.map((m) => (m.id === id ? updated : m)));
+  } catch (e) {
+    reportError(e);
   }
 }
 

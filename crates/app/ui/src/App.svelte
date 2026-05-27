@@ -1,15 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { loadAll } from "./lib/stores/macros";
+  import { loadAll, snapshot } from "./lib/stores/macros";
   import MacroTable from "./lib/components/MacroTable.svelte";
+  import EditMetadataModal from "./lib/components/EditMetadataModal.svelte";
   import ToastHost from "./lib/components/ToastHost.svelte";
+  import type { MacroDto } from "./lib/types";
 
-  // EditMetadataModal hook-up lands in Task 11. For now, edit shows a toast.
+  let editing = $state<MacroDto | null>(null);
+
   function handlePlay(_id: string) {
     // Wired up in Task 13.
   }
-  function handleEdit(_id: string) {
-    // Wired up in Task 11.
+
+  function handleEdit(id: string) {
+    const m = snapshot().find((x) => x.id === id);
+    if (m) editing = m;
   }
 
   onMount(() => {
@@ -22,6 +27,9 @@
     <h1>rust-macro</h1>
   </header>
   <MacroTable onPlay={handlePlay} onEdit={handleEdit} />
+  {#if editing}
+    <EditMetadataModal macro={editing} onClose={() => (editing = null)} />
+  {/if}
   <ToastHost />
 </main>
 
