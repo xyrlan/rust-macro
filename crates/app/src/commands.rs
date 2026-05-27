@@ -120,6 +120,21 @@ pub async fn load_macro_steps(
     Ok(m.steps.iter().map(crate::dto::StepDto::from).collect())
 }
 
+#[tauri::command]
+pub async fn create_macro(
+    state: State<'_, AppState>,
+    name: String,
+    trigger: TriggerDto,
+    playback: PlaybackModeDto,
+    steps: Vec<crate::dto::StepDto>,
+) -> Result<MacroDto, WireError> {
+    let mut m = rm_macro_model::Macro::new(name, trigger.into(), playback.into());
+    m.steps = steps.into_iter().map(Into::into).collect();
+    m.validate().map_err(|e| AppError::Other(e).to_wire())?;
+    storage_save(&state.storage_root, &m).map_err(|e| e.to_wire())?;
+    Ok(MacroDto::from(&m))
+}
+
 use crate::state::ActivePlayback;
 use rm_player::play;
 use serde::Serialize;
@@ -442,6 +457,32 @@ mod tests {
             Trigger::Hotkey { key: KeyCode::F5, .. }));
         assert!(matches!(reloaded.playback, PlaybackMode::Repeat { count: 3 }));
         assert_eq!(reloaded.steps.len(), 1); // steps preserved
+    }
+
+    #[tokio::test]
+    async fn create_macro_persists_with_provided_fields_and_steps() {
+        let (_tmp, state) = fixture_state();
+        // Mirror the command body:
+        let name = "captured-demo".to_string();
+        let trigger = Trigger::Hotkey {
+            key: KeyCode::F1,
+            modifiers: vec![Modifier::Ctrl],
+        };
+        let playback = PlaybackMode::Once;
+        let steps = vec![
+            Step::KeyPress { key: KeyCode::A, hold_ms: 80 },
+            Step::Wait { min_ms: 100, max_ms: 100 },
+        ];
+
+        let mut m = rm_macro_model::Macro::new(&name, trigger.clone(), playback.clone());
+        m.steps = steps.clone();
+        m.validate().unwrap();
+        save_macro(&state.storage_root, &m).unwrap();
+
+        let all = load_all(&state.storage_root).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, name);
+        assert_eq!(all[0].steps.len(), 2);
     }
 
     #[tokio::test]
