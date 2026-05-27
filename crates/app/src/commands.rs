@@ -530,6 +530,11 @@ pub async fn clear_pending_reboot(state: State<'_, AppState>) -> Result<(), Wire
     Ok(())
 }
 
+#[tauri::command]
+pub async fn reboot_windows() -> Result<(), WireError> {
+    crate::driver_install::restart_windows().map_err(|e| e.to_wire())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

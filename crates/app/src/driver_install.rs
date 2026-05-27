@@ -127,6 +127,26 @@ fn spawn_runas_wait(_installer: &Path, _args: &str) -> Result<(), AppError> {
     Err(AppError::Other("driver install is Windows-only".into()))
 }
 
+/// Trigger a Windows shutdown-and-restart with a small delay so the GUI
+/// can close cleanly. Uses `shutdown.exe /r /t 10 /d p:4:1` (restart in
+/// 10 seconds, reason = planned application) which doesn't require
+/// special privileges for a user-initiated restart.
+#[cfg(target_os = "windows")]
+pub fn restart_windows() -> Result<(), AppError> {
+    let result = std::process::Command::new("shutdown.exe")
+        .args(["/r", "/t", "10", "/d", "p:4:1"])
+        .spawn();
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(AppError::Other(format!("shutdown.exe spawn: {e}"))),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn restart_windows() -> Result<(), AppError> {
+    Err(AppError::Other("restart_windows is Windows-only".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
