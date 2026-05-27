@@ -447,15 +447,18 @@ pub async fn driver_status(state: State<'_, AppState>) -> Result<crate::dto::Dri
     #[cfg(not(feature = "interception"))]
     let status = crate::dto::DriverStatusDto::NotInstalled;
 
-    let pending_reboot = *state.pending_reboot.lock().await;
-
-    // If the driver is now Running, the reboot took effect — clear the flag
-    // in the returned response (file marker cleared elsewhere; this surface
-    // value just doesn't propagate a stale "pending" past success).
+    // If the driver is now Running, the reboot took effect — self-heal:
+    // clear both the in-memory flag and the file marker so subsequent
+    // launches don't keep seeding pending_reboot=true forever.
     let pending_reboot = if matches!(status, crate::dto::DriverStatusDto::Running) {
+        let mut flag = state.pending_reboot.lock().await;
+        if *flag {
+            *flag = false;
+            let _ = crate::driver_install::clear_pending_marker(&state.storage_root);
+        }
         false
     } else {
-        pending_reboot
+        *state.pending_reboot.lock().await
     };
 
     Ok(crate::dto::DriverStateDto { status, pending_reboot })
