@@ -9,6 +9,9 @@
   import RecordingModal from "./lib/components/RecordingModal.svelte";
   import PlaybackBanner from "./lib/components/PlaybackBanner.svelte";
   import ToastHost from "./lib/components/ToastHost.svelte";
+  import DriverStatusBanner from "./lib/components/DriverStatusBanner.svelte";
+  import RebootPromptModal from "./lib/components/RebootPromptModal.svelte";
+  import { refresh as refreshDriver } from "./lib/stores/driver";
 
   type View =
     | { tag: "list" }
@@ -26,6 +29,7 @@
     void loadAll();
     void startPlaybackListening();
     void startRecordingListening();
+    void refreshDriver();
   });
 
   onDestroy(() => {
@@ -33,6 +37,8 @@
     void stopRecordingListening();
   });
 </script>
+
+<DriverStatusBanner />
 
 {#if view.tag === "list"}
   <main>
@@ -51,6 +57,8 @@
   <SettingsView onBack={backToList} />
   <ToastHost />
 {/if}
+
+<RebootPromptModal />
 
 <style>
   main {
