@@ -8,7 +8,10 @@
 //!      receives those and calls `play_macro_internal` directly. Paused while
 //!      a recording or playback is active.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use rm_driver::DriverHub;
 use rm_hotkey::{start_listener as start_hotkey_listener, HotkeyHit, HotkeyRegistry, ListenerHandle};
@@ -21,6 +24,7 @@ use crate::state::AppState;
 pub struct ActiveListener {
     pub hub: Arc<DriverHub>,
     pub registry: HotkeyRegistry,
+    pub paused: Arc<AtomicBool>,
     pub hotkey_handle: Option<ListenerHandle>,
     pub passthrough_stop_tx: Option<oneshot::Sender<()>>,
     pub dispatcher_stop_tx: Option<oneshot::Sender<()>>,
@@ -33,6 +37,10 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
         rm_driver_interception::open_with_status()?,
     );
     let hub = DriverHub::start(drv);
+
+    let paused = Arc::new(AtomicBool::new(false));
+    let pt_paused = paused.clone();
+    let disp_paused = paused.clone();
 
     // Passthrough subscriber — synchronous subscribe per DriverHub invariant.
     let pt_rx = hub.subscribe().ok_or_else(|| {
@@ -47,6 +55,7 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
                 _ = &mut pt_stop_rx => { debug!("listener passthrough: stop"); break; }
                 got = rx.recv() => match got {
                     Ok(event) => {
+                        if pt_paused.load(Ordering::SeqCst) { continue; }
                         if let Err(e) = pt_hub.send(event).await {
                             debug!(error = ?e, "listener passthrough: send failed");
                         }
@@ -77,6 +86,7 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
                 _ = &mut disp_stop_rx => { debug!("listener dispatcher: stop"); break; }
                 hit = rx.recv() => match hit {
                     Some(HotkeyHit(id)) => {
+                        if disp_paused.load(Ordering::SeqCst) { continue; }
                         // Skip if recording or playback is currently active.
                         if let Some(s) = app_for_disp.try_state::<AppState>() {
                             let busy = s.recording.lock().await.is_some()
@@ -99,6 +109,7 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
     Ok(ActiveListener {
         hub,
         registry,
+        paused,
         hotkey_handle: Some(hotkey_handle),
         passthrough_stop_tx: Some(pt_stop_tx),
         dispatcher_stop_tx: Some(disp_stop_tx),

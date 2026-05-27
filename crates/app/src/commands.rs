@@ -386,6 +386,14 @@ pub async fn start_recording(
         });
     }
 
+    // Pause the listener (passthrough + dispatcher) so it doesn't double-
+    // forward events the recorder is already forwarding, and so the stop
+    // key doesn't trigger an incidental macro.
+    #[cfg(feature = "interception")]
+    if let Some(l) = state.listener.lock().await.as_ref() {
+        l.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     // Spawn the supervisor. It owns the handle; on completion it clears the
     // slot and emits `recording_finished`.
     spawn_supervisor(app.clone(), handle, stop_rx);

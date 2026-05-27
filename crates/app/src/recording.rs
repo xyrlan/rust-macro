@@ -54,6 +54,12 @@ pub fn spawn_supervisor(
         if let Some(s) = app.try_state::<AppState>() {
             let mut recording = s.recording.lock().await;
             *recording = None;
+            drop(recording);
+
+            #[cfg(feature = "interception")]
+            if let Some(l) = s.listener.lock().await.as_ref() {
+                l.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
         } else {
             tracing::error!(
                 "recording supervisor: AppState not registered — recording slot may be stuck"
