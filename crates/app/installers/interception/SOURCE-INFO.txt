@@ -1,0 +1,36 @@
+Interception kernel driver — source and license info
+=====================================================
+
+This directory contains the installer binary from oblitum's Interception
+project, redistributed under LGPL-3.0.
+
+Upstream:        https://github.com/oblitum/Interception
+Version:         v1.0.1 (released 2017-05-12)
+License:         LGPL-3.0 (see LICENSE-LGPL.txt; non-commercial usage)
+Signed:          NO — the upstream binary is NOT digitally signed. Windows
+                 SmartScreen will warn on first launch; the user must
+                 explicitly approve "Run anyway". This is a property of the
+                 upstream binary, not a modification by rust-macro.
+
+install-interception.exe SHA-256:
+  E137863A79DA797F08E7A137280FF2A123809044A888FD75CE9C973198915ABE
+
+Usage:
+  install-interception.exe /install      — register driver, requires admin + reboot
+  install-interception.exe /uninstall    — remove driver, requires admin + reboot
+
+rust-macro invokes the installer via UAC elevation (ShellExecuteExW with the
+"runas" verb) from the Settings page and the driver-status banner.
+
+To replace this driver with a modified Interception build:
+1. Uninstall the bundled version (Settings → Interception driver → Uninstall).
+2. Reboot.
+3. Build/install your own Interception variant via the upstream repo.
+
+rust-macro dynamically loads `interception.dll` at runtime via the
+`kanata-interception` crate from the system path (`C:\Windows\System32`
+after install), so swapping the driver is non-invasive — no relinking of
+rust-macro is required.
+
+For commercial usage of Interception (per oblitum's dual-licensing model),
+see `licenses/commercial-usage/` in the upstream release archive.

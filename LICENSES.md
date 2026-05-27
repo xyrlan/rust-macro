@@ -29,6 +29,36 @@ For development and personal use, no distribution obligation applies.
 For binary distribution, revisit the obligations or switch to a custom thin
 FFI binding (option B in the design spec).
 
+### Bundled Interception installer (binary redistribution, Plan 3d)
+
+Built installers of this project (`.msi`, `.exe`) include the unmodified
+binary `install-interception.exe` from oblitum's Interception project
+(version `v1.0.1`, released 2017-05-12), redistributed under LGPL-3.0.
+
+The bundled `crates/app/installers/interception/` directory contains:
+- `install-interception.exe` — the installer/uninstaller (470 KB, unsigned).
+  Invoke with `/install` to register the driver, `/uninstall` to remove.
+- `LICENSE-LGPL.txt` — full LGPL-3.0 text (from upstream `licenses/non-commercial-usage/`).
+- `SOURCE-INFO.txt` — pointer to upstream, version pin, SHA-256, usage notes.
+
+**Note on signing:** the upstream `install-interception.exe` is **not**
+digitally signed. Windows SmartScreen will display a warning on first
+launch; the user must explicitly approve. This is a property of the
+upstream binary, not a modification by rust-macro.
+
+The LGPL "lesser license" obligations for binary redistribution are met
+because:
+1. The Interception driver loads as a Windows kernel filter; the rust-macro
+   user-space process dynamically links to `interception.dll` only (loaded
+   from `C:\Windows\System32` after install).
+2. The user can replace the installed driver with a modified version
+   without rebuilding rust-macro — uninstall the bundled version via the
+   Settings page, reboot, install a custom Interception build.
+3. Source/version info is included in the install directory.
+
+For commercial usage of Interception (oblitum's dual-licensing model),
+see `licenses/commercial-usage/` in the upstream release archive.
+
 ### Other deps
 
 Workspace `Cargo.toml` lists all direct dependencies. Run `cargo license`
