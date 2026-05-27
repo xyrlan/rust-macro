@@ -1,15 +1,17 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { loadAll, snapshot } from "./lib/stores/macros";
+  import { play, startListening, stopListening } from "./lib/stores/playback";
   import MacroTable from "./lib/components/MacroTable.svelte";
   import EditMetadataModal from "./lib/components/EditMetadataModal.svelte";
+  import PlaybackBanner from "./lib/components/PlaybackBanner.svelte";
   import ToastHost from "./lib/components/ToastHost.svelte";
   import type { MacroDto } from "./lib/types";
 
   let editing = $state<MacroDto | null>(null);
 
-  function handlePlay(_id: string) {
-    // Wired up in Task 13.
+  function handlePlay(id: string) {
+    void play(id);
   }
 
   function handleEdit(id: string) {
@@ -19,6 +21,11 @@
 
   onMount(() => {
     void loadAll();
+    void startListening();
+  });
+
+  onDestroy(() => {
+    void stopListening();
   });
 </script>
 
@@ -27,6 +34,7 @@
     <h1>rust-macro</h1>
   </header>
   <MacroTable onPlay={handlePlay} onEdit={handleEdit} />
+  <PlaybackBanner />
   {#if editing}
     <EditMetadataModal macro={editing} onClose={() => (editing = null)} />
   {/if}
