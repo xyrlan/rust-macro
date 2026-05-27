@@ -8,6 +8,7 @@ pub mod mouse;
 pub mod scancode;
 pub mod status;
 
+pub use driver::InterceptionDriver;
 pub use status::{detect_status, DriverStatus};
 
 #[cfg(test)]
