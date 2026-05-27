@@ -4,7 +4,7 @@
 // snake_case in the Rust signature. Keep this in mind when adding commands.
 
 import { invoke } from "@tauri-apps/api/core";
-import type { MacroDto, Trigger, PlaybackMode } from "./types";
+import type { MacroDto, Trigger, PlaybackMode, StepDto } from "./types";
 
 export async function loadMacros(): Promise<MacroDto[]> {
   return invoke<MacroDto[]>("load_macros");
@@ -31,4 +31,35 @@ export async function playMacro(id: string): Promise<void> {
 
 export async function stopPlayback(): Promise<void> {
   await invoke("stop_playback");
+}
+
+export async function createMacro(
+  name: string,
+  trigger: Trigger,
+  playback: PlaybackMode,
+  steps: StepDto[],
+): Promise<MacroDto> {
+  return invoke<MacroDto>("create_macro", { name, trigger, playback, steps });
+}
+
+export async function updateMacroFull(
+  id: string,
+  name: string,
+  trigger: Trigger,
+  playback: PlaybackMode,
+  steps: StepDto[],
+): Promise<MacroDto> {
+  return invoke<MacroDto>("update_macro_full", { id, name, trigger, playback, steps });
+}
+
+export async function loadMacroSteps(id: string): Promise<StepDto[]> {
+  return invoke<StepDto[]>("load_macro_steps", { id });
+}
+
+export async function startRecording(): Promise<void> {
+  await invoke("start_recording");
+}
+
+export async function stopRecording(): Promise<void> {
+  await invoke("stop_recording");
 }
