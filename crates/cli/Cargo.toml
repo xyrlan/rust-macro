@@ -7,12 +7,19 @@ edition.workspace = true
 name = "macro-cli"
 path = "src/main.rs"
 
+[features]
+default = []
+# Opt-in: pulls in rm-driver-interception and enables the --driver / `driver`
+# CLI surface. Requires interception.dll on PATH at runtime.
+interception = ["dep:rm-driver-interception"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 dirs = "5"
 rm-driver = { path = "../driver" }
+rm-driver-interception = { path = "../driver-interception", optional = true }
 rm-error = { path = "../error" }
 rm-hotkey = { path = "../hotkey" }
 rm-macro-model = { path = "../macro_model" }
