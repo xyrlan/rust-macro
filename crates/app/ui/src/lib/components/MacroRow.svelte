@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { MacroDto } from "../types";
-  import { inputLabel } from "../types";
+  import { triggerLabel } from "../types";
 
   let {
     macro,
@@ -13,12 +13,6 @@
     onEdit: (id: string) => void;
     onDelete: (id: string) => void;
   } = $props();
-
-  function hotkeyLabel(macro: MacroDto): string {
-    if (macro.trigger.type !== "hotkey") return "—";
-    const parts = [...macro.trigger.modifiers, macro.trigger.key].map(inputLabel);
-    return parts.join("+");
-  }
 
   function modeLabel(macro: MacroDto): string {
     switch (macro.playback.type) {
@@ -38,7 +32,7 @@
 
 <tr>
   <td>{macro.name}</td>
-  <td><code>{hotkeyLabel(macro)}</code></td>
+  <td><code>{triggerLabel(macro.trigger)}</code></td>
   <td>{modeLabel(macro)}</td>
   <td class="num">{macro.step_count}</td>
   <td class="actions">
