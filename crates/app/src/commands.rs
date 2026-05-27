@@ -48,6 +48,30 @@ mod driver_init {
 use driver_init::ensure_hub;
 
 #[cfg(feature = "interception")]
+async fn refresh_registry(state: &AppState) {
+    let listener_guard = state.listener.lock().await;
+    let Some(listener) = listener_guard.as_ref() else { return };
+    let registry = listener.registry.clone();
+    drop(listener_guard);
+
+    // Clear and rebuild from disk.
+    if let Ok(macros) = rm_storage::load_all(&state.storage_root) {
+        // Naive rebuild: unbind all known ids on disk, then rebind. The
+        // registry doesn't expose a "clear all" so we unbind by id from the
+        // on-disk set; any id no longer on disk is naturally absent.
+        for m in &macros {
+            registry.unbind(m.id).await;
+        }
+        for m in macros {
+            registry.bind(m.id, m.trigger).await;
+        }
+    }
+}
+
+#[cfg(not(feature = "interception"))]
+async fn refresh_registry(_state: &AppState) {}
+
+#[cfg(feature = "interception")]
 mod recording_driver {
     use super::*;
     use rm_driver::{Driver, DriverHub};
@@ -93,6 +117,7 @@ pub async fn delete_macro(
     // silent no-op" behavior when the UI is out of sync.
     load_macro(&state.storage_root, id).map_err(|e| e.to_wire())?;
     storage_delete(&state.storage_root, id).map_err(|e| e.to_wire())?;
+    refresh_registry(&state).await;
     Ok(())
 }
 
@@ -112,6 +137,7 @@ pub async fn update_macro_metadata(
     m.updated_at = chrono::Utc::now();
 
     storage_save(&state.storage_root, &m).map_err(|e| e.to_wire())?;
+    refresh_registry(&state).await;
     Ok(MacroDto::from(&m))
 }
 
@@ -136,6 +162,7 @@ pub async fn create_macro(
     m.steps = steps.into_iter().map(Into::into).collect();
     m.validate().map_err(|e| AppError::Other(e).to_wire())?;
     storage_save(&state.storage_root, &m).map_err(|e| e.to_wire())?;
+    refresh_registry(&state).await;
     Ok(MacroDto::from(&m))
 }
 
@@ -156,6 +183,7 @@ pub async fn update_macro_full(
     m.updated_at = chrono::Utc::now();
     m.validate().map_err(|e| AppError::Other(e).to_wire())?;
     storage_save(&state.storage_root, &m).map_err(|e| e.to_wire())?;
+    refresh_registry(&state).await;
     Ok(MacroDto::from(&m))
 }
 
