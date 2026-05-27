@@ -26,6 +26,7 @@ rm-driver-interception = { path = "../driver-interception", optional = true }
 rm-error = { path = "../error" }
 rm-macro-model = { path = "../macro_model" }
 rm-player = { path = "../player" }
+rm-recorder = { path = "../recorder" }
 rm-storage = { path = "../storage" }
 serde.workspace = true
 serde_json.workspace = true

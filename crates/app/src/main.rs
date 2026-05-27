@@ -8,6 +8,7 @@
 
 mod commands;
 mod dto;
+mod recording;
 mod state;
 
 use std::path::PathBuf;
@@ -34,6 +35,8 @@ fn main() {
             commands::update_macro_metadata,
             commands::play_macro,
             commands::stop_playback,
+            commands::start_recording,
+            commands::stop_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

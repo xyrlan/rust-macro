@@ -43,6 +43,35 @@ mod driver_init {
 
 use driver_init::ensure_hub;
 
+#[cfg(feature = "interception")]
+mod recording_driver {
+    use super::*;
+    use rm_driver::{Driver, DriverHub};
+    use rm_driver_interception::open_with_status;
+    use std::sync::Arc;
+
+    /// Open a FRESH Interception context (NOT the lazy playback hub) for the
+    /// current recording session. The caller owns the returned hub via
+    /// ActiveRecording.session_hub and drops it on stop.
+    pub fn open_fresh_hub() -> Result<Arc<DriverHub>, AppError> {
+        let drv: Arc<dyn Driver> = Arc::new(open_with_status()?);
+        Ok(DriverHub::start(drv))
+    }
+}
+
+#[cfg(not(feature = "interception"))]
+mod recording_driver {
+    use super::*;
+    use rm_driver::DriverHub;
+    use std::sync::Arc;
+
+    pub fn open_fresh_hub() -> Result<Arc<DriverHub>, AppError> {
+        Err(AppError::DriverNotInstalled)
+    }
+}
+
+use recording_driver::open_fresh_hub;
+
 #[tauri::command]
 pub async fn load_macros(state: State<'_, AppState>) -> Result<Vec<MacroDto>, WireError> {
     let macros = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
@@ -220,6 +249,80 @@ pub async fn stop_playback(
     let mut active = state.active.lock().await;
     if let Some(ap) = active.as_mut() {
         if let Some(tx) = ap.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+    Ok(())
+}
+
+use crate::recording::{spawn_supervisor, RecordingStartedEvent, STOP_KEY};
+use crate::state::ActiveRecording;
+
+#[tauri::command]
+pub async fn start_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), WireError> {
+    // Reject if a playback is in progress — recorder would capture synthetic keys.
+    {
+        let active = state.active.lock().await;
+        if active.is_some() {
+            return Err(AppError::PlaybackActive.to_wire());
+        }
+    }
+    // Reject if a recording is already in progress.
+    {
+        let recording = state.recording.lock().await;
+        if recording.is_some() {
+            return Err(AppError::RecordingActive.to_wire());
+        }
+    }
+
+    // Open a fresh per-session hub (NOT the lazy playback hub).
+    let hub = open_fresh_hub().map_err(|e| e.to_wire())?;
+
+    // Build the recorder with stop_key = F10.
+    let handle = rm_recorder::start_recording_with_stop_key(
+        hub.clone(),
+        true, // passthrough — let user's typing reach the OS during recording
+        Some(STOP_KEY),
+    );
+
+    // External stop signal (used by `stop_recording` command and by the
+    // window-close handler).
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Reserve the recording slot. Clone hub into the slot so it lives as
+    // long as the recording; the supervisor task also keeps a strong ref.
+    {
+        let mut recording = state.recording.lock().await;
+        *recording = Some(ActiveRecording {
+            stop_tx: Some(stop_tx),
+            session_hub: hub.clone(),
+        });
+    }
+
+    // Spawn the supervisor. It owns the handle; on completion it clears the
+    // slot and emits `recording_finished`.
+    spawn_supervisor(app.clone(), handle, stop_rx);
+
+    // Notify frontend AFTER the slot is populated.
+    let _ = app.emit("recording_started", RecordingStartedEvent {});
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_recording(
+    _app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), WireError> {
+    // Send the cooperative stop signal. The supervisor handles cleanup and
+    // event emission. If F10 already fired, the slot is empty / stop_tx is
+    // None — this is a benign no-op.
+    let mut recording = state.recording.lock().await;
+    if let Some(ar) = recording.as_mut() {
+        if let Some(tx) = ar.stop_tx.take() {
             let _ = tx.send(());
         }
     }
