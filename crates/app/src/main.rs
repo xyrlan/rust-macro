@@ -10,6 +10,7 @@ mod commands;
 mod dto;
 #[cfg(feature = "interception")]
 mod listener;
+mod driver_install;
 mod recording;
 mod settings;
 mod state;
