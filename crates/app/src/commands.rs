@@ -111,7 +111,7 @@ enum PlaybackOutcome {
     /// User clicked Stop (or another stop_playback call took the slot).
     Stopped,
     /// Player returned an error.
-    Failed { kind: &'static str, message: String },
+    Failed { error: WireError },
 }
 
 #[tauri::command]
@@ -165,7 +165,7 @@ pub async fn play_macro(
         let outcome = match (result, stopped.load(std::sync::atomic::Ordering::SeqCst)) {
             (Ok(()), true) => PlaybackOutcome::Stopped,
             (Ok(()), false) => PlaybackOutcome::Ok,
-            (Err(e), _) => PlaybackOutcome::Failed { kind: e.kind(), message: e.to_string() },
+            (Err(e), _) => PlaybackOutcome::Failed { error: e.to_wire() },
         };
 
         // Cleanup: clear active slot if we're still the active playback.

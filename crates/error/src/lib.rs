@@ -42,7 +42,7 @@ impl From<serde_json::Error> for AppError {
 }
 
 /// Wire-friendly serialization for Tauri (Plan 3).
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct WireError {
     pub kind: &'static str,
     pub message: String,
