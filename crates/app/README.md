@@ -1,4 +1,4 @@
-# rm-app — rust-macro Tauri GUI (Plans 3a + 3b)
+# rm-app — rust-macro Tauri GUI (Plans 3a + 3b + 3c)
 
 A desktop GUI for rust-macro: list saved macros, record new ones in-app,
 edit metadata and steps, delete, and play/stop them via the existing
@@ -35,7 +35,7 @@ cargo tauri build
 Output: `target/release/rust-macro.exe` plus installer bundles under
 `target/release/bundle/`.
 
-## Manual smoke test (Plan 3a + 3b acceptance)
+## Manual smoke test (Plan 3a + 3b + 3c acceptance)
 
 1. **Empty state.** Run on a machine with no macros saved. The list shows
    "No macros yet. Click '+ Record new' to capture one."
@@ -77,20 +77,32 @@ Output: `target/release/rust-macro.exe` plus installer bundles under
     the rust-macro window → Interception releases (the OS regains
     keyboard control immediately, no stuck keys). Re-open the app → no
     half-recorded macros in the list.
+14. **Global hotkey.** Save a macro with hotkey Ctrl+F1. Switch to another
+    app (Notepad). Press Ctrl+F1. The macro plays without you clicking ▶.
+15. **Mouse-button trigger.** Edit a macro; switch HotkeyPicker to "Mouse"
+    mode; bind X1 (back button). Save. From any app, press X1 — macro plays.
+16. **Settings — stop key.** Open ⚙ Settings. Change stop key to Escape.
+    Save. Start a new recording; press Escape to stop instead of F10.
+17. **Step compaction.** Record a macro while waving the mouse across the
+    screen. Open the editor; step count should be a handful (one MouseMove
+    per pause + sub-20ms Waits dropped), not hundreds.
+18. **Listener resilience.** Restart the app. Without playing anything, type
+    normally and use the mouse — input flows through, no freeze.
 
 ## Architecture
 
 - 3a design: `docs/superpowers/specs/2026-05-26-rust-macro-plan-3a-tauri-gui-design.md`
 - 3b design: `docs/superpowers/specs/2026-05-27-rust-macro-plan-3b-recording-editor-design.md`
+- 3c plan: `docs/superpowers/plans/2026-05-27-rust-macro-plan-3c-hotkey-mouse-settings.md`
 
-## Known limitations (deferred to Plan 3c+)
+## Known limitations (deferred to Plan 3d+)
 
-- Global hotkey listener (`rm-hotkey`) — triggering macros from another app's focus.
 - Driver status indicator + install button.
-- Settings page (configurable stop key, default storage root, theme).
 - System tray icon + window state persistence.
 - Toast persistence across reloads.
 - Multi-macro concurrent playback.
 - Drag-and-drop step reordering (3b uses ↑↓ buttons only).
 - Hotkey conflict detection.
-- Live hotkey capture via Interception (3b uses browser keyboard events; Win key alone, Print Screen fall back to dropdown).
+- Configurable Wait filter threshold (currently `MIN_WAIT_MS = 20` const).
+- Storage root override is saved but not applied dynamically — requires app restart.
+- Theme customization.
