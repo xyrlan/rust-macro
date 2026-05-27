@@ -18,7 +18,6 @@ pub struct AppState {
 
 pub struct ActivePlayback {
     pub macro_id: Uuid,
-    pub macro_name: String,
     /// User-initiated stop signal. `Some` while the playback is running;
     /// `stop_playback` takes the sender out and fires it. The supervisor
     /// task spawned by `play_macro` observes this via a relay and forwards

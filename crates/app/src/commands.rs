@@ -71,19 +71,15 @@ pub async fn update_macro_metadata(
     trigger: TriggerDto,
     playback: PlaybackModeDto,
 ) -> Result<MacroDto, WireError> {
-    let mut all = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
-    let m = all
-        .iter_mut()
-        .find(|m| m.id == id)
-        .ok_or_else(|| AppError::MacroNotFound(id.to_string()).to_wire())?;
+    let mut m = load_macro(&state.storage_root, id).map_err(|e| e.to_wire())?;
 
     m.name = name;
     m.trigger = trigger.into();
     m.playback = playback.into();
     m.updated_at = chrono::Utc::now();
 
-    storage_save(&state.storage_root, m).map_err(|e| e.to_wire())?;
-    Ok(MacroDto::from(&*m))
+    storage_save(&state.storage_root, &m).map_err(|e| e.to_wire())?;
+    Ok(MacroDto::from(&m))
 }
 
 use crate::state::ActivePlayback;
@@ -120,16 +116,8 @@ pub async fn play_macro(
     state: State<'_, AppState>,
     id: Uuid,
 ) -> Result<(), WireError> {
-    // Reject if a playback is already active.
-    {
-        let active = state.active.lock().await;
-        if active.is_some() {
-            return Err(AppError::PlaybackActive.to_wire());
-        }
-    }
-
-    // Load the macro before opening the driver, so MacroNotFound surfaces
-    // without an unnecessary Interception context attempt.
+    // Do I/O before reserving the slot so MacroNotFound / driver errors
+    // don't leave us holding a stale reservation.
     let all = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
     let m = all
         .into_iter()
@@ -141,27 +129,43 @@ pub async fn play_macro(
     let macro_id = m.id;
     let macro_name = m.name.clone();
 
-    // The slot's `stop_tx` is what `stop_playback` fires when the user clicks
-    // Stop. A small relay records the user-initiated flag (so we can map the
-    // player's clean exit to `PlaybackOutcome::Stopped` rather than `Ok`) and
-    // forwards the signal to `PlaybackHandle::run_with_stop`, which calls the
-    // handle's internal `stop()` and awaits the player's clean exit between
-    // steps. No tasks are aborted; no players run detached.
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stopped_for_signal = stopped.clone();
-    let (inner_stop_tx, inner_stop_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        if stop_rx.await.is_ok() {
-            stopped_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = inner_stop_tx.send(());
-        }
-    });
 
+    // Reserve the active slot atomically: check + write under one lock.
+    {
+        let mut active = state.active.lock().await;
+        if active.is_some() {
+            return Err(AppError::PlaybackActive.to_wire());
+        }
+        *active = Some(ActivePlayback {
+            macro_id,
+            stop_tx: Some(stop_tx),
+        });
+    }
+
+    // Single supervisor task: hosts both the relay (outer stop -> inner
+    // stop + atomic flag) and the player. The relay is a child task whose
+    // handle we abort+await once the player returns, so it never leaks.
     let app_for_task = app.clone();
     tokio::spawn(async move {
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped_for_signal = stopped.clone();
+        let (inner_stop_tx, inner_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay = tokio::spawn(async move {
+            if stop_rx.await.is_ok() {
+                stopped_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = inner_stop_tx.send(());
+            }
+        });
+
         let handle = play(hub, m);
         let result = handle.run_with_stop(inner_stop_rx).await;
+
+        // Tear down the relay. If the player completed naturally, the
+        // relay is still parked on stop_rx — abort + await flushes it.
+        relay.abort();
+        let _ = relay.await;
+
         let outcome = match (result, stopped.load(std::sync::atomic::Ordering::SeqCst)) {
             (Ok(()), true) => PlaybackOutcome::Stopped,
             (Ok(()), false) => PlaybackOutcome::Ok,
@@ -183,18 +187,6 @@ pub async fn play_macro(
             PlaybackFinishedEvent { macro_id, outcome },
         );
     });
-
-    // Store the active playback. The supervisor task above owns the player.
-    // `stop_playback` takes `stop_tx` out of the slot and fires it; the
-    // supervisor handles the rest.
-    {
-        let mut active = state.active.lock().await;
-        *active = Some(ActivePlayback {
-            macro_id,
-            macro_name: macro_name.clone(),
-            stop_tx: Some(stop_tx),
-        });
-    }
 
     // Emit playback_started after the active slot is populated, so any
     // frontend handler that immediately calls `stop_playback` sees a
@@ -345,7 +337,6 @@ mod tests {
             let mut active = state.active.lock().await;
             *active = Some(crate::state::ActivePlayback {
                 macro_id: Uuid::new_v4(),
-                macro_name: "x".into(),
                 stop_tx: Some(tx),
             });
         }
