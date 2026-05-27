@@ -8,6 +8,8 @@ pub mod mouse;
 pub mod scancode;
 pub mod status;
 
+pub use status::{detect_status, DriverStatus};
+
 #[cfg(test)]
 mod sanity {
     use rm_driver::RawEvent;
