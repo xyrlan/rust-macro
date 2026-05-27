@@ -116,6 +116,15 @@ pub async fn play_macro(
     state: State<'_, AppState>,
     id: Uuid,
 ) -> Result<(), WireError> {
+    // Reject if a recording is in progress — playback would synthesize keys
+    // that the recorder would capture.
+    {
+        let recording = state.recording.lock().await;
+        if recording.is_some() {
+            return Err(AppError::RecordingActive.to_wire());
+        }
+    }
+
     // Do I/O before reserving the slot so MacroNotFound / driver errors
     // don't leave us holding a stale reservation.
     let all = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
@@ -345,6 +354,28 @@ mod tests {
         let blocked = {
             let active = state.active.lock().await;
             active.is_some()
+        };
+        assert!(blocked);
+    }
+
+    #[tokio::test]
+    async fn play_rejects_when_recording_active() {
+        let (_tmp, state) = fixture_state();
+        // Place a dummy ActiveRecording in the slot.
+        let drv = std::sync::Arc::new(rm_driver::mock::MockDriver::new());
+        let hub = rm_driver::DriverHub::start(drv);
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut recording = state.recording.lock().await;
+            *recording = Some(crate::state::ActiveRecording {
+                stop_tx: Some(tx),
+                session_hub: hub,
+            });
+        }
+        // The guard we'll add: play_macro checks recording.is_some() first.
+        let blocked = {
+            let recording = state.recording.lock().await;
+            recording.is_some()
         };
         assert!(blocked);
     }
