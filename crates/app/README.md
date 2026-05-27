@@ -11,9 +11,13 @@ edit metadata and steps, delete, and play/stop them via the existing
 - `tauri-cli` v2: `cargo install tauri-cli --version "^2"`.
 - Node.js 20+ and npm.
 - WebView2 runtime (pre-installed on Windows 11).
-- Interception kernel driver installed — see
-  `docs/superpowers/specs/2026-05-26-rust-macro-plan-2b-real-driver-design.md`.
-  (Required for both Play and in-app Record.)
+- Interception kernel driver — **bundled with the installer (v1.0.1, upstream
+  unsigned)**. On first launch, the app prompts to install it (UAC + reboot
+  required). SmartScreen will warn on first launch of the bundled installer;
+  click "More info" → "Run anyway". For dev builds via `cargo tauri dev`
+  (which doesn't run the installer), download Interception from
+  <https://github.com/oblitum/Interception> and run `install-interception.exe`
+  once.
 
 ## Run in dev
 
@@ -34,6 +38,27 @@ cargo tauri build
 
 Output: `target/release/rust-macro.exe` plus installer bundles under
 `target/release/bundle/`.
+
+## What's in the bundle
+
+The installer (`target/release/bundle/msi/rust-macro_<version>_x64_en-US.msi`
+or the equivalent `.exe`) contains:
+
+- `rust-macro.exe` — the GUI app.
+- `installers/interception/install-interception.exe` — oblitum's Interception
+  installer (v1.0.1, **unsigned upstream**).
+- `installers/interception/LICENSE-LGPL.txt` — driver license (LGPL-3.0,
+  non-commercial usage).
+- `installers/interception/SOURCE-INFO.txt` — pointer to upstream source +
+  SHA-256 + usage notes.
+
+The bundled `install-interception.exe` handles both install and uninstall —
+invoked with `/install` and `/uninstall` flags respectively. There is no
+separate uninstaller binary upstream.
+
+To use a different Interception version, install your own (or build from
+source) before launching rust-macro for the first time — the driver-status
+detector picks up any existing install.
 
 ## Manual smoke test (Plan 3a + 3b + 3c acceptance)
 
@@ -88,6 +113,21 @@ Output: `target/release/rust-macro.exe` plus installer bundles under
     per pause + sub-20ms Waits dropped), not hundreds.
 18. **Listener resilience.** Restart the app. Without playing anything, type
     normally and use the mouse — input flows through, no freeze.
+19. **First-run driver install.** On a clean machine without Interception:
+    launch the app → red banner "Driver not installed" at top → click Install →
+    UAC prompt → SmartScreen warning (unsigned upstream installer) → "Run anyway" →
+    installer runs → banner switches to "Restart required" + reboot modal pops up →
+    click "Restart now" → Windows restarts in 10s → after reboot, app launches
+    with no banner.
+20. **Driver section in Settings.** Open ⚙ Settings → scroll to "Interception
+    driver" → status reads "✅ Running" → "Reinstall" and "Uninstall" buttons
+    visible.
+21. **Uninstall path.** Click Uninstall in Settings → confirm dialog → UAC
+    prompt → driver uninstalled → banner appears "Restart required".
+    (DON'T do this on your daily machine if you use Kanata or AHK-fork.)
+22. **Resilient to user declining UAC.** Click Install in the banner → UAC
+    prompt appears → click "No" → toast: "ShellExecuteExW failed (user may
+    have declined UAC)" → banner unchanged. No crash.
 
 ## Architecture
 
@@ -97,7 +137,6 @@ Output: `target/release/rust-macro.exe` plus installer bundles under
 
 ## Known limitations (deferred to Plan 3d+)
 
-- Driver status indicator + install button.
 - System tray icon + window state persistence.
 - Toast persistence across reloads.
 - Multi-macro concurrent playback.
