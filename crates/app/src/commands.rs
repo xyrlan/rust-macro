@@ -15,15 +15,19 @@ use crate::state::AppState;
 mod driver_init {
     use super::*;
     use rm_driver::{Driver, DriverHub};
-    use rm_driver_interception::open_with_status;
+    use rm_driver_interception::open_send_only_with_status;
     use std::sync::Arc;
 
+    /// Lazy cache for the playback hub. Playback opens Interception in
+    /// **send-only** mode — no capture filters — so the cached context does
+    /// not steal user input between plays. This makes keep-alive caching
+    /// safe and avoids the Interception open cost (~100ms) per playback.
     pub async fn ensure_hub(state: &AppState) -> Result<Arc<DriverHub>, AppError> {
         let mut guard = state.driver_hub.lock().await;
         if let Some(h) = guard.as_ref() {
             return Ok(h.clone());
         }
-        let drv: Arc<dyn Driver> = Arc::new(open_with_status()?);
+        let drv: Arc<dyn Driver> = Arc::new(open_send_only_with_status()?);
         let hub = DriverHub::start(drv);
         *guard = Some(hub.clone());
         Ok(hub)

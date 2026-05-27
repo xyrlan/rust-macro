@@ -46,24 +46,47 @@ impl InterceptionDriver {
     /// devices, spawn the OS pump thread, and return the driver. Returns an
     /// error if the context cannot be opened (driver not installed / DLL
     /// missing / etc).
+    ///
+    /// Use this for **recording** — the filters route every user keystroke /
+    /// mouse event into the context's queue so we can capture them. The
+    /// recorder MUST forward events back via `send()` (passthrough mode) to
+    /// keep the OS responsive while recording is active.
     pub fn new() -> Result<Self, DriverError> {
+        Self::new_impl(true)
+    }
+
+    /// Open an Interception context **without** installing capture filters,
+    /// spawn the OS pump thread (which idles), and return the driver.
+    ///
+    /// Use this for **playback** — we only need to call `send()` to inject
+    /// synthesized events; we never read from the queue. With no filters set,
+    /// the kernel forwards user input directly to the OS without routing it
+    /// through our context, so keyboard and mouse remain fully usable during
+    /// and after playback.
+    pub fn new_send_only() -> Result<Self, DriverError> {
+        Self::new_impl(false)
+    }
+
+    fn new_impl(install_filters: bool) -> Result<Self, DriverError> {
         let raw = Interception::new()
             .ok_or_else(|| DriverError::Unavailable("Interception::new() returned None".into()))?;
 
-        // Filter everything from all keyboard + mouse devices.
-        // KeyFilter::all() and MouseFilter::all() capture every event kind.
-        raw.set_filter(
-            kanata_interception::is_keyboard,
-            kanata_interception::Filter::KeyFilter(
-                kanata_interception::KeyFilter::all(),
-            ),
-        );
-        raw.set_filter(
-            kanata_interception::is_mouse,
-            kanata_interception::Filter::MouseFilter(
-                kanata_interception::MouseFilter::all(),
-            ),
-        );
+        if install_filters {
+            // Filter everything from all keyboard + mouse devices.
+            // KeyFilter::all() and MouseFilter::all() capture every event kind.
+            raw.set_filter(
+                kanata_interception::is_keyboard,
+                kanata_interception::Filter::KeyFilter(
+                    kanata_interception::KeyFilter::all(),
+                ),
+            );
+            raw.set_filter(
+                kanata_interception::is_mouse,
+                kanata_interception::Filter::MouseFilter(
+                    kanata_interception::MouseFilter::all(),
+                ),
+            );
+        }
 
         let ctx = Arc::new(InterceptionCtx(raw));
         let (tx, rx) = mpsc::unbounded_channel();
