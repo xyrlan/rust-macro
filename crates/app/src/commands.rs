@@ -303,7 +303,7 @@ pub async fn stop_playback(
     Ok(())
 }
 
-use crate::recording::{spawn_supervisor, RecordingStartedEvent, STOP_KEY};
+use crate::recording::{spawn_supervisor, RecordingStartedEvent};
 use crate::state::ActiveRecording;
 
 #[tauri::command]
@@ -322,11 +322,14 @@ pub async fn start_recording(
     // Open a fresh per-session hub (NOT the lazy playback hub).
     let hub = open_fresh_hub().map_err(|e| e.to_wire())?;
 
-    // Build the recorder with stop_key = F10.
+    // Read stop key from settings (default F10; user-configurable via the
+    // Settings page).
+    let stop_key = state.settings.lock().await.stop_key;
+
     let handle = rm_recorder::start_recording_with_stop_key(
         hub.clone(),
         true, // passthrough — let user's typing reach the OS during recording
-        Some(STOP_KEY),
+        Some(stop_key),
     );
 
     // External stop signal (used by `stop_recording` command and by the

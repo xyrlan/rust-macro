@@ -2,7 +2,6 @@
 //! per-session DriverHub, ActiveRecording slot cleanup, `recording_finished`
 //! event emission.
 
-use rm_macro_model::KeyCode;
 use rm_recorder::RecordingHandle;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -10,10 +9,6 @@ use tokio::sync::oneshot;
 
 use crate::dto::StepDto;
 use crate::state::AppState;
-
-/// Stop key for in-app recording (hardcoded in 3b; configurable in 3c via
-/// Settings). F10 is chosen for low collision with target apps.
-pub const STOP_KEY: KeyCode = KeyCode::F10;
 
 #[derive(Serialize, Clone)]
 pub struct RecordingStartedEvent {}
