@@ -28,11 +28,12 @@ impl HotkeyRegistry {
     }
 
     pub async fn bind(&self, id: Uuid, mut trigger: Trigger) {
-        let Trigger::Hotkey {
-            ref mut modifiers, ..
-        } = trigger;
-        modifiers.sort();
-        modifiers.dedup();
+        let mods = match &mut trigger {
+            Trigger::Hotkey { modifiers, .. } => modifiers,
+            Trigger::MouseButton { modifiers, .. } => modifiers,
+        };
+        mods.sort();
+        mods.dedup();
         self.inner.lock().await.by_id.insert(id, trigger);
     }
 
@@ -40,15 +41,13 @@ impl HotkeyRegistry {
         self.inner.lock().await.by_id.remove(&id);
     }
 
-    pub async fn match_pressed(&self, key: KeyCode, modifiers: &HashSet<Modifier>) -> Vec<Uuid> {
+    /// Match by a pressed keyboard key. Used by KeyDown handling.
+    pub async fn match_key(&self, key: KeyCode, modifiers: &HashSet<Modifier>) -> Vec<Uuid> {
         let g = self.inner.lock().await;
         g.by_id
             .iter()
             .filter_map(|(id, t)| match t {
-                Trigger::Hotkey {
-                    key: tk,
-                    modifiers: tm,
-                } => {
+                Trigger::Hotkey { key: tk, modifiers: tm } => {
                     let tm_set: HashSet<_> = tm.iter().copied().collect();
                     if *tk == key && tm_set == *modifiers {
                         Some(*id)
@@ -56,6 +55,26 @@ impl HotkeyRegistry {
                         None
                     }
                 }
+                Trigger::MouseButton { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Match by a pressed mouse button. Used by MouseDown handling.
+    pub async fn match_mouse(&self, button: rm_macro_model::MouseButton, modifiers: &HashSet<Modifier>) -> Vec<Uuid> {
+        let g = self.inner.lock().await;
+        g.by_id
+            .iter()
+            .filter_map(|(id, t)| match t {
+                Trigger::MouseButton { button: tb, modifiers: tm } => {
+                    let tm_set: HashSet<_> = tm.iter().copied().collect();
+                    if *tb == button && tm_set == *modifiers {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                }
+                Trigger::Hotkey { .. } => None,
             })
             .collect()
     }
@@ -107,7 +126,7 @@ pub fn start_listener(
                         if let Some(m) = key_as_modifier(key) {
                             mods.insert(m);
                         } else {
-                            for id in registry.match_pressed(key, &mods).await {
+                            for id in registry.match_key(key, &mods).await {
                                 let _ = out_tx.send(HotkeyHit(id));
                             }
                         }
@@ -117,7 +136,12 @@ pub fn start_listener(
                             mods.remove(&m);
                         }
                     }
-                    Ok(_) => { /* mouse events not used for hotkeys in v1 */ }
+                    Ok(RawEvent::MouseDown { button }) => {
+                        for id in registry.match_mouse(button, &mods).await {
+                            let _ = out_tx.send(HotkeyHit(id));
+                        }
+                    }
+                    Ok(_) => { /* mouse up / move / wheel — not used for trigger matching */ }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         debug!(lagged = n, "hotkey: dropped events");
                     }
@@ -163,9 +187,9 @@ mod tests {
         )
         .await;
         let mut s = HashSet::new();
-        assert_eq!(r.match_pressed(KeyCode::F1, &s).await, vec![id]);
+        assert_eq!(r.match_key(KeyCode::F1, &s).await, vec![id]);
         r.unbind(id).await;
-        assert!(r.match_pressed(KeyCode::F1, &s).await.is_empty());
+        assert!(r.match_key(KeyCode::F1, &s).await.is_empty());
 
         // Modifiers must match.
         r.bind(
@@ -176,9 +200,9 @@ mod tests {
             },
         )
         .await;
-        assert!(r.match_pressed(KeyCode::F1, &s).await.is_empty());
+        assert!(r.match_key(KeyCode::F1, &s).await.is_empty());
         s.insert(Modifier::Ctrl);
-        assert_eq!(r.match_pressed(KeyCode::F1, &s).await, vec![id]);
+        assert_eq!(r.match_key(KeyCode::F1, &s).await, vec![id]);
     }
 
     #[tokio::test]
@@ -241,6 +265,37 @@ mod tests {
 
         let r = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
         assert!(r.is_err(), "expected no hit, got {:?}", r);
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listener_dispatches_on_mouse_button_match() {
+        use rm_macro_model::MouseButton;
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+        let reg = HotkeyRegistry::new();
+        let id = Uuid::new_v4();
+        reg.bind(
+            id,
+            Trigger::MouseButton {
+                button: MouseButton::X1,
+                modifiers: vec![Modifier::Ctrl],
+            },
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = start_listener(hub, reg.clone(), tx);
+
+        drv.inject(RawEvent::KeyDown { key: KeyCode::LCtrl });
+        drv.inject(RawEvent::MouseDown { button: MouseButton::X1 });
+
+        let hit = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit, HotkeyHit(id));
 
         handle.shutdown().await;
     }

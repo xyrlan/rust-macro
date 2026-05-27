@@ -3,7 +3,7 @@
 //! internal domain types.
 
 use chrono::{DateTime, Utc};
-use rm_macro_model::{KeyCode, Macro, Modifier, PlaybackMode, Trigger};
+use rm_macro_model::{KeyCode, Macro, Modifier, MouseButton, PlaybackMode, Trigger};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,6 +22,7 @@ pub struct MacroDto {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TriggerDto {
     Hotkey { key: KeyCode, modifiers: Vec<Modifier> },
+    MouseButton { button: MouseButton, modifiers: Vec<Modifier> },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,10 @@ impl From<&Trigger> for TriggerDto {
                 key: *key,
                 modifiers: modifiers.clone(),
             },
+            Trigger::MouseButton { button, modifiers } => TriggerDto::MouseButton {
+                button: *button,
+                modifiers: modifiers.clone(),
+            },
         }
     }
 }
@@ -48,6 +53,7 @@ impl From<TriggerDto> for Trigger {
     fn from(t: TriggerDto) -> Self {
         match t {
             TriggerDto::Hotkey { key, modifiers } => Trigger::Hotkey { key, modifiers },
+            TriggerDto::MouseButton { button, modifiers } => Trigger::MouseButton { button, modifiers },
         }
     }
 }
