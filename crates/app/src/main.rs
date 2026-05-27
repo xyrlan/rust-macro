@@ -31,6 +31,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::load_macros,
             commands::delete_macro,
+            commands::update_macro_metadata,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,12 +1,12 @@
 //! Tauri command handlers. Each command takes `State<'_, AppState>` and
 //! returns `Result<T, WireError>`. Errors map from `AppError::to_wire()`.
 
-use rm_error::WireError;
-use rm_storage::{delete_macro as storage_delete, load_all, load_macro};
+use rm_error::{AppError, WireError};
+use rm_storage::{delete_macro as storage_delete, load_all, load_macro, save_macro as storage_save};
 use tauri::State;
 use uuid::Uuid;
 
-use crate::dto::MacroDto;
+use crate::dto::{MacroDto, PlaybackModeDto, TriggerDto};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -29,10 +29,32 @@ pub async fn delete_macro(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn update_macro_metadata(
+    state: State<'_, AppState>,
+    id: Uuid,
+    name: String,
+    trigger: TriggerDto,
+    playback: PlaybackModeDto,
+) -> Result<MacroDto, WireError> {
+    let mut all = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
+    let m = all
+        .iter_mut()
+        .find(|m| m.id == id)
+        .ok_or_else(|| AppError::MacroNotFound(id.to_string()).to_wire())?;
+
+    m.name = name;
+    m.trigger = trigger.into();
+    m.playback = playback.into();
+    m.updated_at = chrono::Utc::now();
+
+    storage_save(&state.storage_root, m).map_err(|e| e.to_wire())?;
+    Ok(MacroDto::from(&*m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rm_error::AppError;
     use rm_macro_model::{KeyCode, Modifier, PlaybackMode, Step, Trigger};
     use rm_storage::save_macro;
     use tempfile::TempDir;
@@ -102,5 +124,40 @@ mod tests {
 
         storage_delete(&state.storage_root, m.id).unwrap();
         assert_eq!(load_all(&state.storage_root).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_metadata_changes_fields_and_persists() {
+        let (_tmp, state) = fixture_state();
+        let m = fixture_macro("before");
+        let id = m.id;
+        save_macro(&state.storage_root, &m).unwrap();
+
+        // Simulate the command body (the State<'_, AppState> wrapper isn't
+        // constructible without a Tauri runtime).
+        let mut loaded = load_all(&state.storage_root)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == id)
+            .unwrap();
+        loaded.name = "after".into();
+        loaded.trigger = Trigger::Hotkey {
+            key: KeyCode::F5,
+            modifiers: vec![Modifier::Alt],
+        };
+        loaded.playback = PlaybackMode::Repeat { count: 3 };
+        loaded.updated_at = chrono::Utc::now();
+        save_macro(&state.storage_root, &loaded).unwrap();
+
+        let reloaded = load_all(&state.storage_root)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == id)
+            .unwrap();
+        assert_eq!(reloaded.name, "after");
+        assert!(matches!(reloaded.trigger,
+            Trigger::Hotkey { key: KeyCode::F5, .. }));
+        assert!(matches!(reloaded.playback, PlaybackMode::Repeat { count: 3 }));
+        assert_eq!(reloaded.steps.len(), 1); // steps preserved
     }
 }
