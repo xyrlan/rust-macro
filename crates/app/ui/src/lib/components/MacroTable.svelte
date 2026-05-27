@@ -5,9 +5,11 @@
   let {
     onPlay,
     onEdit,
+    onRecord,
   }: {
     onPlay: (id: string) => void;
     onEdit: (id: string) => void;
+    onRecord: () => void;
   } = $props();
 
   function handleDelete(id: string) {
@@ -18,14 +20,14 @@
 <section>
   <div class="header">
     <h2>Macros</h2>
-    <button disabled title="In-app recording lands in Plan 3b">+ Record new (3b)</button>
+    <button class="primary" onclick={onRecord}>+ Record new</button>
   </div>
 
   {#if $loading}
     <p class="empty">Loading…</p>
   {:else if $macros.length === 0}
     <p class="empty">
-      No macros yet. Use the CLI to record one — in-app recording lands in Plan 3b.
+      No macros yet. Click "+ Record new" to capture one.
     </p>
   {:else}
     <table>
@@ -68,10 +70,7 @@
     padding: 2rem 0;
     text-align: center;
   }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
+  table { width: 100%; border-collapse: collapse; }
   th {
     text-align: left;
     padding: 0.5rem;
