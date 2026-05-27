@@ -187,30 +187,29 @@ enum PlaybackOutcome {
     Failed { error: WireError },
 }
 
-#[tauri::command]
-pub async fn play_macro(
+pub(crate) async fn play_macro_internal(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: &AppState,
     id: Uuid,
-) -> Result<(), WireError> {
+) -> Result<(), AppError> {
     // Reject if a recording is in progress — playback would synthesize keys
     // that the recorder would capture.
     {
         let recording = state.recording.lock().await;
         if recording.is_some() {
-            return Err(AppError::RecordingActive.to_wire());
+            return Err(AppError::RecordingActive);
         }
     }
 
     // Do I/O before reserving the slot so MacroNotFound / driver errors
     // don't leave us holding a stale reservation.
-    let all = load_all(&state.storage_root).map_err(|e| e.to_wire())?;
+    let all = load_all(&state.storage_root)?;
     let m = all
         .into_iter()
         .find(|m| m.id == id)
-        .ok_or_else(|| AppError::MacroNotFound(id.to_string()).to_wire())?;
+        .ok_or_else(|| AppError::MacroNotFound(id.to_string()))?;
 
-    let hub = ensure_hub(&state).await.map_err(|e| e.to_wire())?;
+    let hub = ensure_hub(state).await?;
 
     let macro_id = m.id;
     let macro_name = m.name.clone();
@@ -221,7 +220,7 @@ pub async fn play_macro(
     {
         let mut active = state.active.lock().await;
         if active.is_some() {
-            return Err(AppError::PlaybackActive.to_wire());
+            return Err(AppError::PlaybackActive);
         }
         *active = Some(ActivePlayback {
             macro_id,
@@ -283,6 +282,15 @@ pub async fn play_macro(
     );
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn play_macro(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: Uuid,
+) -> Result<(), WireError> {
+    play_macro_internal(app, &state, id).await.map_err(|e| e.to_wire())
 }
 
 #[tauri::command]

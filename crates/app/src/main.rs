@@ -8,6 +8,8 @@
 
 mod commands;
 mod dto;
+#[cfg(feature = "interception")]
+mod listener;
 mod recording;
 mod settings;
 mod state;
