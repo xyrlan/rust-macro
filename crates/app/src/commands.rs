@@ -374,6 +374,25 @@ pub async fn stop_recording(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn load_settings(state: State<'_, AppState>) -> Result<crate::dto::SettingsDto, WireError> {
+    let s = state.settings.lock().await;
+    Ok(crate::dto::SettingsDto::from(&*s))
+}
+
+#[tauri::command]
+pub async fn save_settings(
+    state: State<'_, AppState>,
+    settings: crate::dto::SettingsDto,
+) -> Result<(), WireError> {
+    let new = crate::settings::Settings::from(settings);
+    crate::settings::save(&state.storage_root, &new)
+        .map_err(|e| AppError::Other(e.to_string()).to_wire())?;
+    let mut g = state.settings.lock().await;
+    *g = new;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,7 +402,7 @@ mod tests {
 
     fn fixture_state() -> (TempDir, AppState) {
         let tmp = TempDir::new().unwrap();
-        let state = AppState::new(tmp.path().to_path_buf());
+        let state = AppState::new(tmp.path().to_path_buf(), crate::settings::Settings::default());
         (tmp, state)
     }
 

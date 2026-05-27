@@ -16,6 +16,7 @@ pub struct AppState {
     pub driver_hub: Mutex<Option<Arc<DriverHub>>>,
     pub active: Mutex<Option<ActivePlayback>>,
     pub recording: Mutex<Option<ActiveRecording>>,
+    pub settings: Mutex<crate::settings::Settings>,
 }
 
 pub struct ActivePlayback {
@@ -34,12 +35,13 @@ pub struct ActiveRecording {
 }
 
 impl AppState {
-    pub fn new(storage_root: PathBuf) -> Self {
+    pub fn new(storage_root: PathBuf, settings: crate::settings::Settings) -> Self {
         Self {
             storage_root,
             driver_hub: Mutex::new(None),
             active: Mutex::new(None),
             recording: Mutex::new(None),
+            settings: Mutex::new(settings),
         }
     }
 }

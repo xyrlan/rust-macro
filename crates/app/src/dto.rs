@@ -187,6 +187,33 @@ impl From<StepDto> for rm_macro_model::Step {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SettingsDto {
+    pub stop_key: rm_macro_model::KeyCode,
+    pub storage_root_override: Option<String>,
+}
+
+impl From<&crate::settings::Settings> for SettingsDto {
+    fn from(s: &crate::settings::Settings) -> Self {
+        Self {
+            stop_key: s.stop_key,
+            storage_root_override: s
+                .storage_root_override
+                .as_ref()
+                .map(|p| p.display().to_string()),
+        }
+    }
+}
+
+impl From<SettingsDto> for crate::settings::Settings {
+    fn from(s: SettingsDto) -> Self {
+        crate::settings::Settings {
+            stop_key: s.stop_key,
+            storage_root_override: s.storage_root_override.map(std::path::PathBuf::from),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

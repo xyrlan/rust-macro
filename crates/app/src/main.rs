@@ -28,19 +28,29 @@ fn main() {
         .map(|d| d.join("rust-macro"))
         .unwrap_or_else(|| PathBuf::from("./.rust-macro"));
 
+    // Load settings before constructing AppState. Failure to load is fatal
+    // (corrupt settings.json means the user needs to delete it manually —
+    // silent overwrite would lose their config).
+    let settings = settings::load(&storage_root).unwrap_or_else(|e| {
+        eprintln!("warning: settings load failed ({e}); using defaults");
+        settings::Settings::default()
+    });
+
     tauri::Builder::default()
-        .manage(AppState::new(storage_root))
+        .manage(AppState::new(storage_root, settings))
         .invoke_handler(tauri::generate_handler![
             commands::load_macros,
             commands::delete_macro,
             commands::update_macro_metadata,
-            commands::load_macro_steps,
-            commands::create_macro,
             commands::update_macro_full,
+            commands::create_macro,
+            commands::load_macro_steps,
             commands::play_macro,
             commands::stop_playback,
             commands::start_recording,
             commands::stop_recording,
+            commands::load_settings,
+            commands::save_settings,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
