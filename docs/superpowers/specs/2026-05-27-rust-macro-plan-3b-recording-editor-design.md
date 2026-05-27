@@ -89,6 +89,28 @@ The capture task detects F10 at the event-reception level:
 
 The decision to discard the F10 keydown lives in the app-level wrapper around `rm-recorder`, not in `rm-recorder` itself. The recorder remains a generic event-capture primitive.
 
+### Concurrency guards
+
+`start_recording` rejects in two cases:
+
+| Condition | Error | Why |
+|-----------|-------|-----|
+| `active_playback.is_some()` | `AppError::PlaybackActive.to_wire()` | Recorder would capture the playback's synthetic keys → corrupt recording |
+| `active_recording.is_some()` | `AppError::RecordingActive.to_wire()` | Single-recording-at-a-time |
+
+`play_macro` is **not** modified to reject during recording — this is unidirectional. Rationale: a user trying to start recording while a macro plays gets a clear "stop the playback first" error; a user trying to play while recording is unusual and unsupported, but the Interception fresh-context model means it would just fail to open a second context (the recording owns its own).
+
+Actually — both guards are bidirectional for safety. `play_macro` also rejects with `RecordingActive` if recording is in progress. The lock-acquisition order in both commands is: `active_playback` first, then `active_recording`. This prevents lock-ordering deadlocks.
+
+### Window-close cancels recording
+
+When the user closes the rust-macro window while recording is active, the recording is **cancelled** (captured steps discarded, no Preview modal). Implementation: in `main.rs`, Tauri's window event handler intercepts `WindowEvent::CloseRequested` and:
+
+1. If `state.active.recording.is_some()`: fire stop on its `stop_tx`, await the supervisor (with timeout), then allow close.
+2. Otherwise: allow close immediately.
+
+Rationale: a half-recording is more likely junk than something the user wants saved. The Preview modal is the explicit save gesture; if the user closes the window before reaching it, the intent was to abandon.
+
 ### Backend lifecycle
 
 ```
@@ -98,20 +120,33 @@ ActiveRecording {
 }
 
 start_recording():
-    Acquire active_recording lock.
-    If is_some() → return Err(AppError::RecordingActive).
-    ensure_hub() — same lazy-init as play_macro.
+    Acquire BOTH locks (active_playback, active_recording) in a consistent
+    order. (Use the order: active_playback first, then active_recording —
+    matches what play_macro already does.)
+    If active_playback.is_some() → return Err(AppError::PlaybackActive)
+        (cannot record while playing — recorder would capture synthesized
+        keystrokes from the playback).
+    If active_recording.is_some() → return Err(AppError::RecordingActive).
+
+    Open a FRESH Interception context for this recording session (do NOT
+    reuse the lazy hub from playback). Drop on stop. Rationale: after F10
+    fires and the recorder exits, the recorder is gone but Interception is
+    still capturing keys (no passthrough), so any user typing during the
+    teardown window is silently dropped. Owning + dropping per-session
+    bounds that gap to ~100-300ms (Interception context close) and isolates
+    the recording lifecycle from playback's reused hub.
+
     Build channels: (stop_tx, stop_rx).
-    Build the recording handle (rm-recorder's existing start_recording API,
-        passing the hub and a custom stop strategy).
-    Insert ActiveRecording { stop_tx: Some(stop_tx) }.
-    Release lock.
+    Call rm_recorder::start_recording_with_stop_key(hub, true, KeyCode::F10).
+    Insert ActiveRecording { stop_tx: Some(stop_tx), session_hub: Arc<DriverHub> }.
+    Release the active_recording lock.
     Spawn supervisor task:
-        Capture events; on F10 keydown, fire internal stop + skip the event.
-        Otherwise also poll stop_rx (so frontend's explicit stop_recording
-            command can also end the session).
-        On stop: collect steps, clear ActiveRecording slot via try_state,
-            emit `recording_finished { steps }`.
+        Race recording_handle.run completion against an external stop_rx
+            (so the frontend's stop_recording command also works).
+        On stop: take steps from the handle, drop the session_hub
+            (releases Interception), clear ActiveRecording slot via
+            try_state, emit `recording_finished` with RecordingOutcome::Ok
+            (or Failed if the recorder errored).
     Emit `recording_started`.
     Ok(())
 
@@ -217,7 +252,23 @@ let view = $state<View>({ tag: "list" });
 └─ Wait
 ```
 
-Picking a type appends a new step at the end with sensible defaults (`KeyPress { key: A, hold_ms: 50 }`, `Wait { min_ms: 100, max_ms: 100 }`, etc.). The user then edits the parameters inline as usual.
+Picking a type appends a new step at the end with these defaults:
+
+| Step | Default values |
+|------|----------------|
+| KeyPress | `key: A, hold_ms: 50` |
+| KeyDown | `key: A` |
+| KeyUp | `key: A` |
+| MouseClick | `button: Left, hold_ms: 50, at: None` |
+| MouseMove | `to: { x: 0, y: 0 }, mode: Relative` |
+| MouseScroll | `delta: 0` |
+| Wait | `min_ms: 100, max_ms: 100` |
+
+The user then edits the parameters inline as usual.
+
+**Step variants come pre-correct from the recorder.** `rm-recorder::compile_events` already collapses adjacent `KeyDown(k) → KeyUp(k)` into `KeyPress` and emits raw `KeyDown`/`KeyUp` for overlapping inputs (see test `overlapping_keys_emit_raw_down_up` in `crates/recorder/src/compile.rs`). The editor's row template just needs to render whatever variants happen to be in the macro; no additional collapse / expand logic.
+
+**Concurrent edit policy:** editor uses last-write-wins. No optimistic-concurrency check (single-window app; no contention possible from this codebase).
 
 ### Save behavior
 
@@ -250,6 +301,12 @@ States of the picker:
 3. **Captured** (transient, ~300ms): banner shows the captured combo in big text, then auto-commits and returns to Idle with the new value set.
 
 Esc at any time during Listening cancels back to Idle without changing the value.
+
+**Validation rules during capture:**
+
+- Capture requires **at least one non-modifier key**. Modifier-only combos (e.g. Shift alone) cannot be committed — picker stays in Listening until a non-modifier is pressed or Esc cancels.
+- 5-second timeout: if no non-modifier keydown arrives within 5 seconds of entering Listening, picker auto-cancels back to Idle. Prevents the picker from getting stuck if the user clicks Capture and walks away.
+- Esc is reserved for Cancel — cannot be bound as a hotkey via Capture. (The dropdown still allows `escape` as a fallback if a user really wants it.)
 
 ### Capture implementation
 
@@ -360,10 +417,11 @@ pub enum MoveModeDto { Absolute, Relative }
 | `load_macros` | unchanged | List view (no steps) |
 | `load_macro_steps(id)` | NEW | Editor needs the steps for the chosen macro |
 | `create_macro(name, trigger, playback, steps)` | NEW | After successful recording, persist as new |
-| `update_macro_full(id, name, trigger, playback, steps)` | NEW | Step editor's Save |
-| `update_macro_metadata` | RETIRED | Subsumed by `update_macro_full` |
+| `update_macro_full(id, name, trigger, playback, steps)` | NEW | Step editor's Save (full payload incl. steps) |
+| `update_macro_metadata` | UNCHANGED | Kept for metadata-only edits — smaller payload, used by future hotkey-only flows |
 | `delete_macro` | unchanged | |
-| `play_macro` / `stop_playback` | unchanged | |
+| `play_macro` | MODIFIED | Also rejects with `RecordingActive` if recording is in progress |
+| `stop_playback` | unchanged | |
 | `start_recording` | NEW | Open Interception, begin capture |
 | `stop_recording` | NEW | Explicit stop (F10 path doesn't need this) |
 
@@ -409,6 +467,10 @@ pub struct AppState {
 
 pub struct ActiveRecording {
     pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Per-session DriverHub. Owned by the slot so it lives as long as the
+    /// recording does; dropped when the slot is cleared on stop. NOT shared
+    /// with the lazy playback hub (see start_recording for rationale).
+    pub session_hub: Arc<DriverHub>,
 }
 ```
 
@@ -454,6 +516,7 @@ crates/app/ui/src/
 - Drag-and-drop step reordering (the ↑↓ buttons satisfy MVP)
 - Live hotkey capture via Interception (for keys browser can't see) — fallback to dropdown is acceptable for 3b
 - Configurable stop key — F10 is hardcoded; configurable in Settings (3c)
+- Hotkey conflict detection (binding the same combo to two macros) — no checks in 3a or 3b; deferred to 3c+ when global hotkey integration makes it observable
 - Mouse coordinate (`MouseClick.at`) editor — recordings always capture `None`; manual editing of click coordinates is deferred
 
 ---
@@ -487,18 +550,29 @@ crates/app/ui/src/
 
 5. **Manual smoke (added to `crates/app/README.md`):**
    - Record a macro from scratch via the GUI; play it back.
+   - After F10 stop, the rust-macro window restores AND re-takes focus; Preview modal is interactive immediately (no need to click the window first).
    - Edit a macro's steps (delete one, change a wait timing, add a new step); save; play it back; new behavior is reflected.
    - Bind a hotkey by clicking Capture and pressing Ctrl+Shift+F5; verify the combo is set.
+   - Try to start recording while a macro is playing → see `PlaybackActive` toast.
+   - Try to start a playback while a recording is in progress → see `RecordingActive` toast.
+   - Close the rust-macro window mid-recording → Interception releases, app exits cleanly, captured steps are discarded.
 
 ---
 
 ## Open implementation notes
 
 - **`rm-recorder` extension:** the existing crate exposes `start_recording(hub, passthrough: bool)` returning a handle. The handle has `wait_for_close()` and `finish()` methods. For F10-aware stopping, the recommended approach is to **extend `rm-recorder` with a stop-key parameter** rather than building a parallel listener in `rm-app`. Specifically: add a `start_recording_with_stop_key(hub, passthrough, stop_key: KeyCode)` (or change the existing signature with `Option<KeyCode>`). The recorder, which already consumes the event stream, filters out the stop key and ends its own loop when it sees the keydown.
-  
-  Rationale: a parallel-listener approach in `rm-app` would race the recorder for events from the same `DriverHub`, and `DriverHub` may not support multiple subscribers cleanly. Putting the stop-key logic inside the recorder keeps the consumer model single-subscriber.
-  
-  The implementation plan (Plan 3b) will start by reading `rm-recorder/src/lib.rs` to choose the exact API shape and write the test for stop-key behavior.
+
+  **Rationale (corrected):** `DriverHub` supports multiple subscribers cleanly (`broadcast::Receiver` — see `crates/driver/src/hub.rs::two_subscribers_each_receive_every_event`). The reason to put F10 filtering inside the recorder is **passthrough atomicity**: the recorder is the only subscriber that calls `hub.send()` for passthrough re-emission. F10 must be dropped from the buffer AND from the OS-bound re-emit in the same iteration. A parallel listener in `rm-app` would observe F10 too late — the recorder might have already passed it through to the OS.
+
+  **Implementation order for the stop-key filter (REQUIRED):**
+  1. `rx.recv()` returns an event.
+  2. **Before** appending to buffer AND **before** passthrough `hub.send()`: if `event == RawEvent::KeyDown { key: stop_key }`, fire internal stop signal and `continue` (skip this iteration entirely).
+  3. Otherwise proceed normally: passthrough, then append to buffer.
+
+  Without this explicit order, a careless implementation will emit a trailing `KeyPress { F10 }` in the compiled steps.
+
+  The implementation plan will start by reading `rm-recorder/src/lib.rs` to choose the exact API shape and write the test for stop-key behavior.
 
 - **Window minimize/restore on Windows:** Tauri 2 exposes `Window::minimize()` and `Window::unminimize()`. After F10 stop, calling `unminimize()` may not bring focus back; we may also need `set_focus()`. Test during implementation.
 
@@ -512,4 +586,4 @@ crates/app/ui/src/
 
 - **DTO bloat:** introducing `StepDto`, `PointDto`, `MoveModeDto` adds boilerplate. Worth it for the same reason `TriggerDto` was introduced in 3a — wire format independent from the on-disk format.
 
-- **`update_macro_metadata` retirement timing:** the frontend's `api.ts` still imports `updateMacroMetadata`. Plan 3b deletes both the Rust command and the JS wrapper, replacing all callers with `updateMacroFull`. This is a breaking change inside `rm-app` only — no external consumers.
+- **`update_macro_metadata` retained alongside `update_macro_full`:** the existing 3a metadata-only command stays — used today by the editor's existing flow and possibly future surfaces that need to change just hotkey/name without re-sending a large step array. The editor's Save uses `update_macro_full` because it touches steps. Both commands write through `rm-storage::save_macro` and have identical persistence semantics.
