@@ -35,6 +35,7 @@ fn main() {
             commands::update_macro_metadata,
             commands::load_macro_steps,
             commands::create_macro,
+            commands::update_macro_full,
             commands::play_macro,
             commands::stop_playback,
             commands::start_recording,

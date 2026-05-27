@@ -135,6 +135,26 @@ pub async fn create_macro(
     Ok(MacroDto::from(&m))
 }
 
+#[tauri::command]
+pub async fn update_macro_full(
+    state: State<'_, AppState>,
+    id: Uuid,
+    name: String,
+    trigger: TriggerDto,
+    playback: PlaybackModeDto,
+    steps: Vec<crate::dto::StepDto>,
+) -> Result<MacroDto, WireError> {
+    let mut m = load_macro(&state.storage_root, id).map_err(|e| e.to_wire())?;
+    m.name = name;
+    m.trigger = trigger.into();
+    m.playback = playback.into();
+    m.steps = steps.into_iter().map(Into::into).collect();
+    m.updated_at = chrono::Utc::now();
+    m.validate().map_err(|e| AppError::Other(e).to_wire())?;
+    storage_save(&state.storage_root, &m).map_err(|e| e.to_wire())?;
+    Ok(MacroDto::from(&m))
+}
+
 use crate::state::ActivePlayback;
 use rm_player::play;
 use serde::Serialize;
@@ -457,6 +477,31 @@ mod tests {
             Trigger::Hotkey { key: KeyCode::F5, .. }));
         assert!(matches!(reloaded.playback, PlaybackMode::Repeat { count: 3 }));
         assert_eq!(reloaded.steps.len(), 1); // steps preserved
+    }
+
+    #[tokio::test]
+    async fn update_full_replaces_steps_and_metadata() {
+        let (_tmp, state) = fixture_state();
+        let mut m = fixture_macro("before-full");
+        m.steps = vec![Step::Wait { min_ms: 10, max_ms: 10 }];
+        let id = m.id;
+        save_macro(&state.storage_root, &m).unwrap();
+
+        // Mirror the command body:
+        let mut loaded = load_macro(&state.storage_root, id).unwrap();
+        loaded.name = "after-full".into();
+        loaded.steps = vec![
+            Step::KeyPress { key: KeyCode::Z, hold_ms: 60 },
+            Step::Wait { min_ms: 30, max_ms: 30 },
+        ];
+        loaded.updated_at = chrono::Utc::now();
+        loaded.validate().unwrap();
+        save_macro(&state.storage_root, &loaded).unwrap();
+
+        let reloaded = load_macro(&state.storage_root, id).unwrap();
+        assert_eq!(reloaded.name, "after-full");
+        assert_eq!(reloaded.steps.len(), 2);
+        assert!(matches!(reloaded.steps[0], Step::KeyPress { key: KeyCode::Z, .. }));
     }
 
     #[tokio::test]
