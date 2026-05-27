@@ -9,6 +9,7 @@
 mod commands;
 mod dto;
 mod recording;
+mod settings;
 mod state;
 
 use std::path::PathBuf;
