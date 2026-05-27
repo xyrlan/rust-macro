@@ -38,7 +38,7 @@ fn main() {
         settings::Settings::default()
     });
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(AppState::new(storage_root, settings))
         .invoke_handler(tauri::generate_handler![
             commands::load_macros,
@@ -74,7 +74,39 @@ fn main() {
                     }
                 });
             }
-        })
+        });
+
+    #[cfg(feature = "interception")]
+    let builder = builder.setup(|app| {
+        use tauri::Manager;
+        let app_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            // Build the registry from all macros currently on disk.
+            let registry = rm_hotkey::HotkeyRegistry::new();
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                if let Ok(macros) = rm_storage::load_all(&state.storage_root) {
+                    for m in macros {
+                        registry.bind(m.id, m.trigger).await;
+                    }
+                }
+            }
+
+            // Start the listener.
+            match listener::start(app_handle.clone(), registry) {
+                Ok(active) => {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        *state.listener.lock().await = Some(active);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "listener failed to start (driver not installed?); hotkeys disabled");
+                }
+            }
+        });
+        Ok(())
+    });
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

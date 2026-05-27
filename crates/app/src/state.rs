@@ -17,6 +17,8 @@ pub struct AppState {
     pub active: Mutex<Option<ActivePlayback>>,
     pub recording: Mutex<Option<ActiveRecording>>,
     pub settings: Mutex<crate::settings::Settings>,
+    #[cfg(feature = "interception")]
+    pub listener: Mutex<Option<crate::listener::ActiveListener>>,
 }
 
 pub struct ActivePlayback {
@@ -42,6 +44,8 @@ impl AppState {
             active: Mutex::new(None),
             recording: Mutex::new(None),
             settings: Mutex::new(settings),
+            #[cfg(feature = "interception")]
+            listener: Mutex::new(None),
         }
     }
 }
