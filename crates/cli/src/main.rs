@@ -7,6 +7,8 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 mod stdio_driver;
 
+use commands::DriverKind;
+
 #[derive(Parser)]
 #[command(name = "macro-cli", version)]
 struct Cli {
@@ -21,14 +23,54 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Record events from stdin (JSONL) and save under `name`.
-    Record { name: String },
-    /// Play the macro named `name` (events emitted to stdout JSONL).
-    Play { name: String },
+    /// Record events from the selected driver and save under `name`.
+    Record {
+        name: String,
+        #[cfg(feature = "interception")]
+        #[arg(long, value_enum, default_value_t = DriverKindArg::Stdio)]
+        driver: DriverKindArg,
+    },
+    /// Play the macro named `name` via the selected driver.
+    Play {
+        name: String,
+        #[cfg(feature = "interception")]
+        #[arg(long, value_enum, default_value_t = DriverKindArg::Stdio)]
+        driver: DriverKindArg,
+    },
     /// List all saved macros.
     List,
     /// Delete the macro named `name`.
     Delete { name: String },
+    /// Interception driver utilities (status / install instructions).
+    #[cfg(feature = "interception")]
+    Driver {
+        #[command(subcommand)]
+        sub: DriverCmd,
+    },
+}
+
+#[cfg(feature = "interception")]
+#[derive(Subcommand)]
+enum DriverCmd {
+    /// Print Interception driver status.
+    Status,
+}
+
+#[cfg(feature = "interception")]
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum DriverKindArg {
+    Stdio,
+    Interception,
+}
+
+#[cfg(feature = "interception")]
+impl From<DriverKindArg> for DriverKind {
+    fn from(d: DriverKindArg) -> Self {
+        match d {
+            DriverKindArg::Stdio => DriverKind::Stdio,
+            DriverKindArg::Interception => DriverKind::Interception,
+        }
+    }
 }
 
 #[tokio::main]
@@ -47,10 +89,34 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let res: Result<()> = match cli.cmd {
-        Cmd::Record { name } => commands::cmd_record(&root, &name).await,
-        Cmd::Play { name } => commands::cmd_play(&root, &name).await,
+        Cmd::Record {
+            name,
+            #[cfg(feature = "interception")]
+            driver,
+        } => {
+            #[cfg(feature = "interception")]
+            let kind = driver.into();
+            #[cfg(not(feature = "interception"))]
+            let kind = DriverKind::Stdio;
+            commands::cmd_record(&root, &name, kind).await
+        }
+        Cmd::Play {
+            name,
+            #[cfg(feature = "interception")]
+            driver,
+        } => {
+            #[cfg(feature = "interception")]
+            let kind = driver.into();
+            #[cfg(not(feature = "interception"))]
+            let kind = DriverKind::Stdio;
+            commands::cmd_play(&root, &name, kind).await
+        }
         Cmd::List => commands::cmd_list(&root),
         Cmd::Delete { name } => commands::cmd_delete(&root, &name),
+        #[cfg(feature = "interception")]
+        Cmd::Driver { sub } => match sub {
+            DriverCmd::Status => commands::cmd_driver_status(),
+        },
     };
     res.map_err(|e| anyhow::anyhow!("{e}"))
 }
