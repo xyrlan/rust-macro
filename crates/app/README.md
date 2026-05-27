@@ -1,4 +1,4 @@
-# rm-app — rust-macro Tauri GUI (Plans 3a + 3b + 3c)
+# rm-app — rust-macro Tauri GUI (Plans 3a + 3b + 3c + 3d)
 
 A desktop GUI for rust-macro: list saved macros, record new ones in-app,
 edit metadata and steps, delete, and play/stop them via the existing
@@ -60,7 +60,7 @@ To use a different Interception version, install your own (or build from
 source) before launching rust-macro for the first time — the driver-status
 detector picks up any existing install.
 
-## Manual smoke test (Plan 3a + 3b + 3c acceptance)
+## Manual smoke test (Plan 3a + 3b + 3c + 3d acceptance)
 
 1. **Empty state.** Run on a machine with no macros saved. The list shows
    "No macros yet. Click '+ Record new' to capture one."
@@ -134,8 +134,9 @@ detector picks up any existing install.
 - 3a design: `docs/superpowers/specs/2026-05-26-rust-macro-plan-3a-tauri-gui-design.md`
 - 3b design: `docs/superpowers/specs/2026-05-27-rust-macro-plan-3b-recording-editor-design.md`
 - 3c plan: `docs/superpowers/plans/2026-05-27-rust-macro-plan-3c-hotkey-mouse-settings.md`
+- 3d plan: `docs/superpowers/plans/2026-05-27-rust-macro-plan-3d-driver-bundling.md`
 
-## Known limitations (deferred to Plan 3d+)
+## Known limitations (deferred to Plan 4+)
 
 - System tray icon + window state persistence.
 - Toast persistence across reloads.
