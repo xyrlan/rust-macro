@@ -6,3 +6,4 @@ Cargo.lock.bak
 crates/app/ui/node_modules/
 crates/app/ui/dist/
 crates/app/ui/.vite/
+crates/app/gen/
