@@ -2,6 +2,39 @@
 name = "rm-app"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
-# Stub created by Task 2 to unblock workspace resolution; full scaffold in Task 5.
+
+[[bin]]
+name = "rust-macro"
+path = "src/main.rs"
+
+[features]
+default = ["interception"]
+# Pulls in rm-driver-interception. Disable with --no-default-features for
+# builds that need to avoid the transitive LGPL-3.0 obligation from
+# interception-sys (see LICENSES.md). Without this feature, `play_macro`
+# returns DriverNotInstalled and the GUI is read-only.
+interception = ["dep:rm-driver-interception"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+rm-driver = { path = "../driver" }
+rm-driver-interception = { path = "../driver-interception", optional = true }
+rm-error = { path = "../error" }
+rm-macro-model = { path = "../macro_model" }
+rm-player = { path = "../player" }
+rm-storage = { path = "../storage" }
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
