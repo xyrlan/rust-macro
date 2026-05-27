@@ -18,6 +18,9 @@ pub enum AppError {
     #[error("A recording is already in progress")]
     RecordingActive,
 
+    #[error("A playback is already in progress")]
+    PlaybackActive,
+
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -53,6 +56,7 @@ impl AppError {
             AppError::DriverIo(_) => "DriverIo",
             AppError::MacroNotFound(_) => "MacroNotFound",
             AppError::RecordingActive => "RecordingActive",
+            AppError::PlaybackActive => "PlaybackActive",
             AppError::Io { .. } => "Io",
             AppError::Serde(_) => "Serde",
             AppError::Other(_) => "Other",
@@ -99,5 +103,14 @@ mod tests {
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains("\"kind\":\"DriverIo\""));
         assert!(json.contains("device closed"));
+    }
+
+    #[test]
+    fn playback_active_kind_is_stable() {
+        assert_eq!(AppError::PlaybackActive.kind(), "PlaybackActive");
+        assert_eq!(
+            AppError::PlaybackActive.to_string(),
+            "A playback is already in progress"
+        );
     }
 }
