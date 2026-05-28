@@ -150,6 +150,33 @@ impl InterceptionDriver {
 #[async_trait]
 impl Driver for InterceptionDriver {
     async fn send(&self, event: RawEvent) -> Result<(), DriverError> {
+        // EXPERIMENT: route mouse events through Win32 SendInput instead of
+        // Interception's filter-driver send path. Reason: anti-tamper of
+        // Capcom RE Engine bypasses the Interception filter chain entirely
+        // when the game is running — recording and playback of mouse fail
+        // because the events never reach our context. SendInput injects at
+        // the user-mode input queue, above the filter driver, so it remains
+        // visible to Raw Input subscribers in protected processes.
+        //
+        // The dwExtraInfo carries the per-device signature observed from the
+        // user's hardware, in case the engine validates that field too.
+        //
+        // Keyboard sends still go through Interception so this is a targeted
+        // experiment with minimal scope. If the in-game mouse-look responds
+        // after this change, we know the full Plan-4 architectural migration
+        // (Raw Input for capture, SendInput for everything) is the right
+        // direction.
+        if matches!(
+            event,
+            RawEvent::MouseMove { .. }
+                | RawEvent::MouseDown { .. }
+                | RawEvent::MouseUp { .. }
+                | RawEvent::MouseWheel { .. }
+        ) {
+            let extra = self.last_mouse_information.load(Ordering::Relaxed) as usize;
+            return sendinput::send_mouse(event, extra);
+        }
+
         let stroke = match event_to_stroke(event) {
             Some(s) => s,
             None => {
@@ -379,3 +406,91 @@ const _: fn() = || {
     let _: KeyCode = KeyCode::A;
     let _: MouseButton = MouseButton::Left;
 };
+
+/// EXPERIMENTAL: Win32 SendInput path for mouse events. The Interception
+/// filter chain is bypassed by anti-tamper in some games (Capcom RE Engine),
+/// but SendInput injects at the user-mode input queue and is delivered as
+/// regular Raw Input events that protected processes still see.
+mod sendinput {
+    use rm_driver::{DriverError, RawEvent};
+    use rm_macro_model::MouseButton;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    };
+
+    // XBUTTON1 / XBUTTON2 aren't re-exported in this windows-sys module —
+    // they're the high 16 bits identifier in mouseData for X buttons.
+    const XBUTTON1: u32 = 0x0001;
+    const XBUTTON2: u32 = 0x0002;
+
+    pub fn send_mouse(event: RawEvent, extra_info: usize) -> Result<(), DriverError> {
+        let mi = match event_to_mouseinput(event, extra_info) {
+            Some(mi) => mi,
+            None => return Ok(()),
+        };
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 { mi },
+        };
+        let sent = unsafe {
+            SendInput(1, &input, std::mem::size_of::<INPUT>() as i32)
+        };
+        if sent == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(DriverError::Io(format!("SendInput failed: {err}")));
+        }
+        Ok(())
+    }
+
+    fn event_to_mouseinput(event: RawEvent, extra_info: usize) -> Option<MOUSEINPUT> {
+        match event {
+            RawEvent::MouseMove { dx, dy } => Some(MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: extra_info,
+            }),
+            RawEvent::MouseDown { button } | RawEvent::MouseUp { button } => {
+                let down = matches!(event, RawEvent::MouseDown { .. });
+                let (flags, data) = button_flags(button, down);
+                Some(MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: data,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: extra_info,
+                })
+            }
+            RawEvent::MouseWheel { delta } => Some(MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: delta as u32,
+                dwFlags: MOUSEEVENTF_WHEEL,
+                time: 0,
+                dwExtraInfo: extra_info,
+            }),
+            _ => None,
+        }
+    }
+
+    fn button_flags(b: MouseButton, down: bool) -> (u32, u32) {
+        match (b, down) {
+            (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+            (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
+            (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+            (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
+            (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+            (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+            (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, XBUTTON1),
+            (MouseButton::X1, false) => (MOUSEEVENTF_XUP, XBUTTON1),
+            (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, XBUTTON2),
+            (MouseButton::X2, false) => (MOUSEEVENTF_XUP, XBUTTON2),
+        }
+    }
+}
