@@ -2702,14 +2702,15 @@ dependencies = [
 name = "rm-app"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "dirs 5.0.1",
  "rm-driver",
  "rm-driver-interception",
  "rm-error",
+ "rm-hotkey",
  "rm-macro-model",
  "rm-player",
+ "rm-recorder",
  "rm-storage",
  "serde",
  "serde_json",
@@ -2720,6 +2721,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

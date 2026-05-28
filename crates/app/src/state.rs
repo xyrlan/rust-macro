@@ -1,6 +1,8 @@
-//! Runtime state for the Tauri app. `DriverHub` is created lazily on the
-//! first `play_macro` call; `active` enforces one-playback-at-a-time;
-//! `recording` owns the per-session Interception hub for in-app recording.
+//! Runtime state for the Tauri app. `listener` owns the single shared
+//! Interception context (with capture filters). Both recording and playback
+//! borrow this hub — see `commands::ensure_hub` for the reasoning. `active`
+//! enforces one-playback-at-a-time; `recording` holds the per-session
+//! supervisor stop signal.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +15,6 @@ use uuid::Uuid;
 /// `State<'_, AppState>` parameter.
 pub struct AppState {
     pub storage_root: PathBuf,
-    pub driver_hub: Mutex<Option<Arc<DriverHub>>>,
     pub active: Mutex<Option<ActivePlayback>>,
     pub recording: Mutex<Option<ActiveRecording>>,
     pub settings: Mutex<crate::settings::Settings>,
@@ -29,9 +30,10 @@ pub struct ActivePlayback {
     pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-/// Per-session recording state. Owns its own DriverHub (NOT the lazy playback
-/// hub) so the Interception context can be released cleanly when the
-/// recording ends — see Plan 3b's "Backend lifecycle" notes.
+/// Per-session recording state. `session_hub` holds a clone of the listener's
+/// hub for the duration of the recording (kept around for symmetry with
+/// `ActivePlayback`; the underlying Interception context is owned by the
+/// listener and outlives the recording).
 pub struct ActiveRecording {
     pub stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub session_hub: Arc<DriverHub>,
@@ -41,7 +43,6 @@ impl AppState {
     pub fn new(storage_root: PathBuf, settings: crate::settings::Settings, pending_reboot: bool) -> Self {
         Self {
             storage_root,
-            driver_hub: Mutex::new(None),
             active: Mutex::new(None),
             recording: Mutex::new(None),
             settings: Mutex::new(settings),

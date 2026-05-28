@@ -1,19 +1,20 @@
 //! Persistent listener — runs from app boot to shutdown. Owns a single
 //! filtered `Arc<DriverHub>` and subscribes for two purposes:
 //!   1. **Passthrough forwarding**: every received event is re-sent via
-//!      `hub.send(event)` so the OS keeps seeing user input. Paused while
-//!      a recording session is active (the recorder owns passthrough).
+//!      `hub.send(event)` so the OS keeps seeing user input. Runs unconditionally
+//!      — even during recording. The recorder shares this hub (does NOT open a
+//!      second Interception context, which would silently starve since the
+//!      kernel routes each stroke to one context only). To prevent the recording
+//!      stop key from leaking to apps, `suppress_key` tells the passthrough to
+//!      drop matching KeyDown/KeyUp while a recording is active.
 //!   2. **Hotkey dispatch**: rm-hotkey's `start_listener` watches for trigger
 //!      matches and emits `HotkeyHit` on the channel. The dispatcher task
-//!      receives those and calls `play_macro_internal` directly. Paused while
-//!      a recording or playback is active.
+//!      receives those and calls `play_macro_internal` directly. Skipped when
+//!      a recording or playback is active (checks `state.recording`/`state.active`).
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
-use rm_driver::DriverHub;
+use rm_driver::{DriverHub, RawEvent};
 use rm_hotkey::{start_listener as start_hotkey_listener, HotkeyHit, HotkeyRegistry, ListenerHandle};
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, oneshot};
@@ -24,7 +25,16 @@ use crate::state::AppState;
 pub struct ActiveListener {
     pub hub: Arc<DriverHub>,
     pub registry: HotkeyRegistry,
-    pub paused: Arc<AtomicBool>,
+    /// When `Some(k)`, the passthrough drops KeyDown/KeyUp for `k` so it
+    /// doesn't reach the OS. Set to the recording stop key while a recording
+    /// is active; cleared by the supervisor on completion.
+    pub suppress_key: Arc<std::sync::Mutex<Option<rm_macro_model::KeyCode>>>,
+    /// Configured stop key (default F10) — when this key is pressed while a
+    /// playback is active, the listener fires that playback's stop signal and
+    /// suppresses the keystroke so it doesn't leak to apps. Mirrored from
+    /// `settings.stop_key`; refreshed by `save_settings` when the user changes
+    /// the setting.
+    pub stop_key: Arc<std::sync::Mutex<rm_macro_model::KeyCode>>,
     pub hotkey_handle: Option<ListenerHandle>,
     pub passthrough_stop_tx: Option<oneshot::Sender<()>>,
     pub dispatcher_stop_tx: Option<oneshot::Sender<()>>,
@@ -32,15 +42,23 @@ pub struct ActiveListener {
 
 /// Open Interception (with filters), spawn passthrough + dispatcher tasks.
 /// Returns the assembled `ActiveListener` for storage in AppState.
-pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener, rm_error::AppError> {
+pub fn start(
+    app: AppHandle,
+    registry: HotkeyRegistry,
+    initial_stop_key: rm_macro_model::KeyCode,
+) -> Result<ActiveListener, rm_error::AppError> {
     let drv: Arc<dyn rm_driver::Driver> = Arc::new(
         rm_driver_interception::open_with_status()?,
     );
     let hub = DriverHub::start(drv);
 
-    let paused = Arc::new(AtomicBool::new(false));
-    let pt_paused = paused.clone();
-    let disp_paused = paused.clone();
+    let suppress_key: Arc<std::sync::Mutex<Option<rm_macro_model::KeyCode>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let pt_suppress = suppress_key.clone();
+    let stop_key: Arc<std::sync::Mutex<rm_macro_model::KeyCode>> =
+        Arc::new(std::sync::Mutex::new(initial_stop_key));
+    let pt_stop_key = stop_key.clone();
+    let pt_app = app.clone();
 
     // Passthrough subscriber — synchronous subscribe per DriverHub invariant.
     let pt_rx = hub.subscribe().ok_or_else(|| {
@@ -55,7 +73,35 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
                 _ = &mut pt_stop_rx => { debug!("listener passthrough: stop"); break; }
                 got = rx.recv() => match got {
                     Ok(event) => {
-                        if pt_paused.load(Ordering::SeqCst) { continue; }
+                        // Suppress the recording stop key so the user's F10
+                        // (or whatever they configured) doesn't leak to apps
+                        // while they're recording. Read+release the std Mutex
+                        // before any await.
+                        let suppress = *pt_suppress.lock().unwrap();
+                        if let Some(sk) = suppress {
+                            if let RawEvent::KeyDown { key } | RawEvent::KeyUp { key } = event {
+                                if key == sk { continue; }
+                            }
+                        }
+                        // Emergency stop: stop_key during active playback
+                        // kills the playback and suppresses the keystroke
+                        // (otherwise the user can't recover from a runaway
+                        // Loop macro without killing the process).
+                        if let RawEvent::KeyDown { key } = event {
+                            let configured = *pt_stop_key.lock().unwrap();
+                            if key == configured {
+                                if let Some(s) = pt_app.try_state::<AppState>() {
+                                    let mut active = s.active.lock().await;
+                                    if let Some(ap) = active.as_mut() {
+                                        if let Some(tx) = ap.stop_tx.take() {
+                                            let _ = tx.send(());
+                                            debug!("listener: emergency stop fired via stop_key");
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         if let Err(e) = pt_hub.send(event).await {
                             debug!(error = ?e, "listener passthrough: send failed");
                         }
@@ -86,7 +132,6 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
                 _ = &mut disp_stop_rx => { debug!("listener dispatcher: stop"); break; }
                 hit = rx.recv() => match hit {
                     Some(HotkeyHit(id)) => {
-                        if disp_paused.load(Ordering::SeqCst) { continue; }
                         // Skip if recording or playback is currently active.
                         if let Some(s) = app_for_disp.try_state::<AppState>() {
                             let busy = s.recording.lock().await.is_some()
@@ -109,7 +154,8 @@ pub fn start(app: AppHandle, registry: HotkeyRegistry) -> Result<ActiveListener,
     Ok(ActiveListener {
         hub,
         registry,
-        paused,
+        suppress_key,
+        stop_key,
         hotkey_handle: Some(hotkey_handle),
         passthrough_stop_tx: Some(pt_stop_tx),
         dispatcher_stop_tx: Some(disp_stop_tx),

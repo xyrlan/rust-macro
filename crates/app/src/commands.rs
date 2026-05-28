@@ -14,23 +14,24 @@ use crate::state::AppState;
 #[cfg(feature = "interception")]
 mod driver_init {
     use super::*;
-    use rm_driver::{Driver, DriverHub};
-    use rm_driver_interception::open_send_only_with_status;
+    use rm_driver::DriverHub;
     use std::sync::Arc;
 
-    /// Lazy cache for the playback hub. Playback opens Interception in
-    /// **send-only** mode — no capture filters — so the cached context does
-    /// not steal user input between plays. This makes keep-alive caching
-    /// safe and avoids the Interception open cost (~100ms) per playback.
+    /// Return the listener's filtered hub for playback. We deliberately do
+    /// NOT open a separate send-only context, even though playback only needs
+    /// to send: the kernel driver routes a context's `send` strokes back
+    /// through OTHER contexts' filters, so a separate send-only playback
+    /// context would have its injected strokes re-intercepted by the
+    /// listener's filter and re-relayed via the listener's own `send`,
+    /// doubling every event the OS sees (cursor jumps at 2x speed, keys
+    /// double-trigger, etc). Sending through the listener's OWN context
+    /// avoids this — Interception does not re-intercept same-context sends.
     pub async fn ensure_hub(state: &AppState) -> Result<Arc<DriverHub>, AppError> {
-        let mut guard = state.driver_hub.lock().await;
-        if let Some(h) = guard.as_ref() {
-            return Ok(h.clone());
-        }
-        let drv: Arc<dyn Driver> = Arc::new(open_send_only_with_status()?);
-        let hub = DriverHub::start(drv);
-        *guard = Some(hub.clone());
-        Ok(hub)
+        let listener_guard = state.listener.lock().await;
+        let l = listener_guard
+            .as_ref()
+            .ok_or(AppError::DriverNotInstalled)?;
+        Ok(l.hub.clone())
     }
 }
 
@@ -70,35 +71,6 @@ async fn refresh_registry(state: &AppState) {
 
 #[cfg(not(feature = "interception"))]
 async fn refresh_registry(_state: &AppState) {}
-
-#[cfg(feature = "interception")]
-mod recording_driver {
-    use super::*;
-    use rm_driver::{Driver, DriverHub};
-    use rm_driver_interception::open_with_status;
-    use std::sync::Arc;
-
-    /// Open a FRESH Interception context (NOT the lazy playback hub) for the
-    /// current recording session. The caller owns the returned hub via
-    /// ActiveRecording.session_hub and drops it on stop.
-    pub fn open_fresh_hub() -> Result<Arc<DriverHub>, AppError> {
-        let drv: Arc<dyn Driver> = Arc::new(open_with_status()?);
-        Ok(DriverHub::start(drv))
-    }
-}
-
-#[cfg(not(feature = "interception"))]
-mod recording_driver {
-    use super::*;
-    use rm_driver::DriverHub;
-    use std::sync::Arc;
-
-    pub fn open_fresh_hub() -> Result<Arc<DriverHub>, AppError> {
-        Err(AppError::DriverNotInstalled)
-    }
-}
-
-use recording_driver::open_fresh_hub;
 
 #[tauri::command]
 pub async fn load_macros(state: State<'_, AppState>) -> Result<Vec<MacroDto>, WireError> {
@@ -355,53 +327,68 @@ pub async fn start_recording(
         }
     }
 
-    // Open a fresh per-session hub (NOT the lazy playback hub).
-    let hub = open_fresh_hub().map_err(|e| e.to_wire())?;
-
     // Read stop key from settings (default F10; user-configurable via the
     // Settings page).
     let stop_key = state.settings.lock().await.stop_key;
 
-    let handle = rm_recorder::start_recording_with_stop_key(
-        hub.clone(),
-        true, // passthrough — let user's typing reach the OS during recording
-        Some(stop_key),
-    );
-
-    // External stop signal (used by `stop_recording` command and by the
-    // window-close handler).
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-
-    // Reserve the recording slot atomically: check + write under one lock.
-    // If another start_recording call won the race, we return early; the
-    // local hub and handle are dropped here, releasing Interception cleanly.
-    {
-        let mut recording = state.recording.lock().await;
-        if recording.is_some() {
-            return Err(AppError::RecordingActive.to_wire());
-        }
-        *recording = Some(ActiveRecording {
-            stop_tx: Some(stop_tx),
-            session_hub: hub.clone(),
-        });
-    }
-
-    // Pause the listener (passthrough + dispatcher) so it doesn't double-
-    // forward events the recorder is already forwarding, and so the stop
-    // key doesn't trigger an incidental macro.
+    // Share the listener's existing filtered hub. Opening a second
+    // Interception context here would silently starve: the kernel routes each
+    // hardware stroke to one context only (precedence-based, ties broken by
+    // creation order), and the listener — created at boot — wins. The
+    // recorder runs with `passthrough: false` because the listener's
+    // passthrough task is the relay; we tell it to drop the stop key via
+    // `suppress_key` so F10 doesn't leak to apps.
     #[cfg(feature = "interception")]
-    if let Some(l) = state.listener.lock().await.as_ref() {
-        l.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (hub, suppress_key) = {
+        let listener_guard = state.listener.lock().await;
+        let l = listener_guard
+            .as_ref()
+            .ok_or_else(|| AppError::DriverNotInstalled.to_wire())?;
+        (l.hub.clone(), l.suppress_key.clone())
+    };
+    #[cfg(not(feature = "interception"))]
+    return Err(AppError::DriverNotInstalled.to_wire());
+
+    #[cfg(feature = "interception")]
+    {
+        let handle = rm_recorder::start_recording_with_stop_key(
+            hub.clone(),
+            false, // listener already relays — recorder must NOT also send
+            Some(stop_key),
+        );
+
+        // External stop signal (used by `stop_recording` command and by the
+        // window-close handler).
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Reserve the recording slot atomically: check + write under one lock.
+        // If another start_recording call won the race, we return early; the
+        // local handle is dropped here.
+        {
+            let mut recording = state.recording.lock().await;
+            if recording.is_some() {
+                return Err(AppError::RecordingActive.to_wire());
+            }
+            *recording = Some(ActiveRecording {
+                stop_tx: Some(stop_tx),
+                session_hub: hub.clone(),
+            });
+        }
+
+        // Activate stop-key suppression so the listener's passthrough drops
+        // F10 (KeyDown and KeyUp) for the duration of the recording. The
+        // hotkey dispatcher already skips when `state.recording.is_some()`.
+        *suppress_key.lock().unwrap() = Some(stop_key);
+
+        // Spawn the supervisor. It owns the handle; on completion it clears
+        // the slot, clears suppress_key, and emits `recording_finished`.
+        spawn_supervisor(app.clone(), handle, stop_rx);
+
+        // Notify frontend AFTER the slot is populated.
+        let _ = app.emit("recording_started", RecordingStartedEvent {});
+
+        Ok(())
     }
-
-    // Spawn the supervisor. It owns the handle; on completion it clears the
-    // slot and emits `recording_finished`.
-    spawn_supervisor(app.clone(), handle, stop_rx);
-
-    // Notify frontend AFTER the slot is populated.
-    let _ = app.emit("recording_started", RecordingStartedEvent {});
-
-    Ok(())
 }
 
 #[tauri::command]
@@ -435,8 +422,17 @@ pub async fn save_settings(
     let new = crate::settings::Settings::from(settings);
     crate::settings::save(&state.storage_root, &new)
         .map_err(|e| AppError::Other(e.to_string()).to_wire())?;
+    let new_stop_key = new.stop_key;
     let mut g = state.settings.lock().await;
     *g = new;
+    drop(g);
+
+    // Refresh the listener's cached stop_key so the emergency-stop path
+    // honors the new setting without an app restart.
+    #[cfg(feature = "interception")]
+    if let Some(l) = state.listener.lock().await.as_ref() {
+        *l.stop_key.lock().unwrap() = new_stop_key;
+    }
     Ok(())
 }
 

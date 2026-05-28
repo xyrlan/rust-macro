@@ -93,18 +93,38 @@ fn main() {
         use tauri::Manager;
         let app_handle = app.handle().clone();
         tauri::async_runtime::spawn(async move {
-            // Build the registry from all macros currently on disk.
+            // Build the registry from all macros currently on disk. Skip
+            // unsafe triggers (bare Left/Right/Middle click) so a pre-existing
+            // disaster macro can't auto-fire on boot — the user has to edit
+            // the trigger or delete the macro before it'll bind again.
             let registry = rm_hotkey::HotkeyRegistry::new();
             if let Some(state) = app_handle.try_state::<AppState>() {
                 if let Ok(macros) = rm_storage::load_all(&state.storage_root) {
                     for m in macros {
+                        if !m.trigger.is_safe() {
+                            tracing::warn!(
+                                macro_id = %m.id,
+                                name = %m.name,
+                                "skipping unsafe trigger (bare Left/Right/Middle click) — not bound"
+                            );
+                            continue;
+                        }
                         registry.bind(m.id, m.trigger).await;
                     }
                 }
             }
 
+            // Snapshot the current stop_key so the listener can use it for
+            // emergency-stop on playback (the listener can refresh this via
+            // save_settings if the user changes it).
+            let initial_stop_key = if let Some(state) = app_handle.try_state::<AppState>() {
+                state.settings.lock().await.stop_key
+            } else {
+                rm_macro_model::KeyCode::F10
+            };
+
             // Start the listener.
-            match listener::start(app_handle.clone(), registry) {
+            match listener::start(app_handle.clone(), registry, initial_stop_key) {
                 Ok(active) => {
                     if let Some(state) = app_handle.try_state::<AppState>() {
                         *state.listener.lock().await = Some(active);
