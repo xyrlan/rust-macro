@@ -2,7 +2,7 @@
 //! Interception's blocking `wait_with_timeout` to async via a dedicated OS
 //! thread + `tokio::sync::mpsc` channel.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,18 @@ pub struct InterceptionDriver {
     /// Slot of the most recent mouse the pump has seen (11..=20). See
     /// `last_keyboard_device` for rationale. Initialized to 11.
     last_mouse_device: Arc<AtomicI32>,
+    /// `ulExtraInformation` of the most recent keyboard stroke the pump has
+    /// seen. Re-injected on `send()` so synthesized strokes carry the same
+    /// per-device signature as hardware events. Many gaming peripherals and
+    /// anti-tamper subsystems (Capcom RE Engine in particular) use this field
+    /// as a heuristic to distinguish "real" input from automation; a sudden
+    /// drop to 0 mid-session causes them to filter out the synthesized events.
+    /// Initialized to 0 — same as legacy behavior when no hardware has been
+    /// observed.
+    last_keyboard_information: Arc<AtomicU32>,
+    /// `ulExtraInformation` of the most recent mouse stroke the pump has seen.
+    /// See `last_keyboard_information` for rationale.
+    last_mouse_information: Arc<AtomicU32>,
 }
 
 impl InterceptionDriver {
@@ -104,14 +116,22 @@ impl InterceptionDriver {
         let shutdown = Arc::new(AtomicBool::new(false));
         let last_keyboard_device = Arc::new(AtomicI32::new(1));
         let last_mouse_device = Arc::new(AtomicI32::new(11));
+        let last_keyboard_information = Arc::new(AtomicU32::new(0));
+        let last_mouse_information = Arc::new(AtomicU32::new(0));
 
         let thread_ctx = ctx.clone();
         let thread_shutdown = shutdown.clone();
         let thread_last_kbd = last_keyboard_device.clone();
         let thread_last_mouse = last_mouse_device.clone();
+        let thread_last_kbd_info = last_keyboard_information.clone();
+        let thread_last_mouse_info = last_mouse_information.clone();
         let thread = std::thread::Builder::new()
             .name("interception-pump".into())
-            .spawn(move || pump(thread_ctx, tx, thread_shutdown, thread_last_kbd, thread_last_mouse))
+            .spawn(move || pump(
+                thread_ctx, tx, thread_shutdown,
+                thread_last_kbd, thread_last_mouse,
+                thread_last_kbd_info, thread_last_mouse_info,
+            ))
             .map_err(|e| DriverError::Io(format!("spawn pump thread: {e}")))?;
 
         Ok(Self {
@@ -121,6 +141,8 @@ impl InterceptionDriver {
             thread: Some(thread),
             last_keyboard_device,
             last_mouse_device,
+            last_keyboard_information,
+            last_mouse_information,
         })
     }
 }
@@ -145,6 +167,21 @@ impl Driver for InterceptionDriver {
                 self.last_keyboard_device.load(Ordering::Relaxed)
             }
             _ => self.last_mouse_device.load(Ordering::Relaxed),
+        };
+        // Re-inject the per-device signature (`ulExtraInformation`) the pump
+        // observed on the user's hardware. Anti-tamper subsystems (Capcom RE
+        // Engine, etc.) use this field as a heuristic to detect synthetic
+        // input — sends with the original signature pass through, sends with
+        // 0 get filtered.
+        let stroke = match stroke {
+            Stroke::Keyboard { code, state, .. } => Stroke::Keyboard {
+                code, state,
+                information: self.last_keyboard_information.load(Ordering::Relaxed),
+            },
+            Stroke::Mouse { state, flags, rolling, x, y, .. } => Stroke::Mouse {
+                state, flags, rolling, x, y,
+                information: self.last_mouse_information.load(Ordering::Relaxed),
+            },
         };
         // `interception_send` is per-context thread-safe; concurrent &self
         // callers serialize at the C boundary, not in our wrapper.
@@ -179,6 +216,8 @@ fn pump(
     shutdown: Arc<AtomicBool>,
     last_keyboard_device: Arc<AtomicI32>,
     last_mouse_device: Arc<AtomicI32>,
+    last_keyboard_information: Arc<AtomicU32>,
+    last_mouse_information: Arc<AtomicU32>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -190,9 +229,11 @@ fn pump(
         }
         // Remember the live slot so `send()` re-injects via the same one.
         // `is_keyboard`/`is_mouse` partition slots 1..=10 / 11..=20.
-        if kanata_interception::is_keyboard(device) {
+        let is_kbd = kanata_interception::is_keyboard(device);
+        let is_mouse = kanata_interception::is_mouse(device);
+        if is_kbd {
             last_keyboard_device.store(device, Ordering::Relaxed);
-        } else if kanata_interception::is_mouse(device) {
+        } else if is_mouse {
             last_mouse_device.store(device, Ordering::Relaxed);
         }
         let mut buf = [Stroke::Keyboard {
@@ -205,6 +246,19 @@ fn pump(
             continue;
         }
         for stroke in &buf[..n as usize] {
+            // Capture the per-device signature so `send()` can re-inject it.
+            // The kernel populates `information` from `MOUSE_INPUT_DATA::
+            // ExtraInformation` / equivalent; gaming-mouse drivers set this
+            // to a stable nonzero value, and anti-tamper checks rely on it.
+            match stroke {
+                Stroke::Keyboard { information, .. } if is_kbd => {
+                    last_keyboard_information.store(*information, Ordering::Relaxed);
+                }
+                Stroke::Mouse { information, .. } if is_mouse => {
+                    last_mouse_information.store(*information, Ordering::Relaxed);
+                }
+                _ => {}
+            }
             for ev in convert_stroke(*stroke).iter() {
                 if event_tx.send(ev).is_err() {
                     return; // receiver dropped; exit cleanly
