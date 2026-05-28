@@ -2,7 +2,7 @@
 //! Interception's blocking `wait_with_timeout` to async via a dedicated OS
 //! thread + `tokio::sync::mpsc` channel.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +39,17 @@ pub struct InterceptionDriver {
     event_rx: AsyncMutex<mpsc::UnboundedReceiver<RawEvent>>,
     shutdown: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Slot of the most recent keyboard the pump has seen (1..=10). Used as
+    /// the target for `send()` so a relay re-injects via the same virtual
+    /// device the real user typed on — critical when Interception has more
+    /// than one keyboard driver instance installed, or when the user's
+    /// physical keyboard isn't at slot 1. Initialized to 1 (the default
+    /// install's first keyboard slot) so playback also works before any
+    /// hardware input has been observed.
+    last_keyboard_device: Arc<AtomicI32>,
+    /// Slot of the most recent mouse the pump has seen (11..=20). See
+    /// `last_keyboard_device` for rationale. Initialized to 11.
+    last_mouse_device: Arc<AtomicI32>,
 }
 
 impl InterceptionDriver {
@@ -91,12 +102,16 @@ impl InterceptionDriver {
         let ctx = Arc::new(InterceptionCtx(raw));
         let (tx, rx) = mpsc::unbounded_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let last_keyboard_device = Arc::new(AtomicI32::new(1));
+        let last_mouse_device = Arc::new(AtomicI32::new(11));
 
         let thread_ctx = ctx.clone();
         let thread_shutdown = shutdown.clone();
+        let thread_last_kbd = last_keyboard_device.clone();
+        let thread_last_mouse = last_mouse_device.clone();
         let thread = std::thread::Builder::new()
             .name("interception-pump".into())
-            .spawn(move || pump(thread_ctx, tx, thread_shutdown))
+            .spawn(move || pump(thread_ctx, tx, thread_shutdown, thread_last_kbd, thread_last_mouse))
             .map_err(|e| DriverError::Io(format!("spawn pump thread: {e}")))?;
 
         Ok(Self {
@@ -104,6 +119,8 @@ impl InterceptionDriver {
             event_rx: AsyncMutex::new(rx),
             shutdown,
             thread: Some(thread),
+            last_keyboard_device,
+            last_mouse_device,
         })
     }
 }
@@ -111,18 +128,31 @@ impl InterceptionDriver {
 #[async_trait]
 impl Driver for InterceptionDriver {
     async fn send(&self, event: RawEvent) -> Result<(), DriverError> {
-        let (device, stroke) = match event_to_stroke(event) {
-            Some(pair) => pair,
+        let stroke = match event_to_stroke(event) {
+            Some(s) => s,
             None => {
                 tracing::debug!(?event, "interception: unmapped RawEvent dropped on send");
                 return Ok(());
             }
         };
+        // Route to the slot we last saw activity on for this device class.
+        // The user's physical device might be on any slot 1..=10 (keyboard)
+        // or 11..=20 (mouse) depending on driver installation order; the pump
+        // tracks the live slot so the relay re-injects through the correct
+        // virtual device.
+        let device = match event {
+            RawEvent::KeyDown { .. } | RawEvent::KeyUp { .. } => {
+                self.last_keyboard_device.load(Ordering::Relaxed)
+            }
+            _ => self.last_mouse_device.load(Ordering::Relaxed),
+        };
         // `interception_send` is per-context thread-safe; concurrent &self
         // callers serialize at the C boundary, not in our wrapper.
         let sent = self.ctx.0.send(device, &[stroke]);
         if sent == 0 {
-            return Err(DriverError::Io("interception_send wrote 0 strokes".into()));
+            return Err(DriverError::Io(format!(
+                "interception_send wrote 0 strokes (device={device}, event={event:?})"
+            )));
         }
         Ok(())
     }
@@ -147,6 +177,8 @@ fn pump(
     ctx: Arc<InterceptionCtx>,
     event_tx: mpsc::UnboundedSender<RawEvent>,
     shutdown: Arc<AtomicBool>,
+    last_keyboard_device: Arc<AtomicI32>,
+    last_mouse_device: Arc<AtomicI32>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -155,6 +187,13 @@ fn pump(
         let device = ctx.0.wait_with_timeout(WAIT_SLICE);
         if device == 0 {
             continue; // timeout — loop back to shutdown check
+        }
+        // Remember the live slot so `send()` re-injects via the same one.
+        // `is_keyboard`/`is_mouse` partition slots 1..=10 / 11..=20.
+        if kanata_interception::is_keyboard(device) {
+            last_keyboard_device.store(device, Ordering::Relaxed);
+        } else if kanata_interception::is_mouse(device) {
+            last_mouse_device.store(device, Ordering::Relaxed);
         }
         let mut buf = [Stroke::Keyboard {
             code: kanata_interception::ScanCode::Esc,
@@ -208,13 +247,12 @@ fn convert_stroke(s: Stroke) -> crate::mouse::StrokeEvents {
     }
 }
 
-/// Inverse of `convert_stroke` for a single `RawEvent`. Returns the target
-/// device id + the stroke to send. Returns `None` for events we can't
-/// represent (and will be debug-logged + dropped by the caller).
-///
-/// Device ids: Interception keyboards are 1–10, mice are 11–20.
-/// We send to device 1 (first keyboard) / 11 (first mouse).
-fn event_to_stroke(event: RawEvent) -> Option<(kanata_interception::Device, Stroke)> {
+/// Inverse of `convert_stroke` for a single `RawEvent`. Returns the stroke
+/// shape only — the target device id is chosen by the caller (`send`) based
+/// on the slot the pump last observed for that device class. Returns `None`
+/// for events we can't represent (and will be debug-logged + dropped by the
+/// caller).
+fn event_to_stroke(event: RawEvent) -> Option<Stroke> {
     use kanata_interception::{KeyState, ScanCode};
     match event {
         RawEvent::KeyDown { key } | RawEvent::KeyUp { key } => {
@@ -226,55 +264,41 @@ fn event_to_stroke(event: RawEvent) -> Option<(kanata_interception::Device, Stro
             if e0 {
                 state |= KeyState::E0;
             }
-            // Convert raw u16 scancode to ScanCode enum; fall back to Esc on unknown.
             let scan = ScanCode::try_from(code).unwrap_or(ScanCode::Esc);
-            Some((
-                1, // device 1 — first keyboard
-                Stroke::Keyboard {
-                    code: scan,
-                    state,
-                    information: 0,
-                },
-            ))
+            Some(Stroke::Keyboard {
+                code: scan,
+                state,
+                information: 0,
+            })
         }
         RawEvent::MouseDown { button } | RawEvent::MouseUp { button } => {
             let down = matches!(event, RawEvent::MouseDown { .. });
             let state = mouse_button_to_state(button, down);
-            Some((
-                11, // device 11 — first mouse
-                Stroke::Mouse {
-                    state,
-                    flags: MouseFlags::empty(),
-                    rolling: 0,
-                    x: 0,
-                    y: 0,
-                    information: 0,
-                },
-            ))
-        }
-        RawEvent::MouseMove { dx, dy } => Some((
-            11,
-            Stroke::Mouse {
-                state: MouseState::empty(),
-                // MOVE_RELATIVE = 0 (the default; no flag bits set)
+            Some(Stroke::Mouse {
+                state,
                 flags: MouseFlags::empty(),
                 rolling: 0,
-                x: dx,
-                y: dy,
-                information: 0,
-            },
-        )),
-        RawEvent::MouseWheel { delta } => Some((
-            11,
-            Stroke::Mouse {
-                state: MouseState::WHEEL,
-                flags: MouseFlags::empty(),
-                rolling: delta as i16,
                 x: 0,
                 y: 0,
                 information: 0,
-            },
-        )),
+            })
+        }
+        RawEvent::MouseMove { dx, dy } => Some(Stroke::Mouse {
+            state: MouseState::empty(),
+            flags: MouseFlags::empty(),
+            rolling: 0,
+            x: dx,
+            y: dy,
+            information: 0,
+        }),
+        RawEvent::MouseWheel { delta } => Some(Stroke::Mouse {
+            state: MouseState::WHEEL,
+            flags: MouseFlags::empty(),
+            rolling: delta as i16,
+            x: 0,
+            y: 0,
+            information: 0,
+        }),
     }
 }
 
