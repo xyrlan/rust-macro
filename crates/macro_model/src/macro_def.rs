@@ -60,6 +60,27 @@ pub enum Trigger {
     },
 }
 
+impl Trigger {
+    /// A trigger is "unsafe" when it would fire on ordinary user activity.
+    /// Specifically: a bare `MouseButton::{Left,Right,Middle}` with no
+    /// modifiers — every click anywhere would launch the macro, and if the
+    /// macro is `Loop`/`Toggle` the user can't reach the Stop button without
+    /// re-triggering the registry. `X1`/`X2` are allowed bare (they're
+    /// dedicated buttons most users don't press accidentally). Hotkey
+    /// triggers are always allowed — keyboard triggers are explicit enough
+    /// (and modifier-less F-keys, while easy to hit, don't fire on routine
+    /// pointer interaction).
+    pub fn is_safe(&self) -> bool {
+        match self {
+            Trigger::Hotkey { .. } => true,
+            Trigger::MouseButton { button, modifiers } => {
+                !modifiers.is_empty()
+                    || matches!(button, MouseButton::X1 | MouseButton::X2)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PlaybackMode {
@@ -100,6 +121,13 @@ impl Macro {
         if self.name.trim().is_empty() {
             return Err("Macro name cannot be empty".into());
         }
+        if !self.trigger.is_safe() {
+            return Err(
+                "Trigger is unsafe: a bare Left/Right/Middle click would fire on every \
+                 ordinary mouse interaction. Add a modifier (Ctrl/Shift/Alt/Win) or use X1/X2."
+                    .into(),
+            );
+        }
         for (i, step) in self.steps.iter().enumerate() {
             step.validate().map_err(|e| format!("step #{i}: {e}"))?;
         }
@@ -111,6 +139,48 @@ impl Macro {
 mod tests {
     use super::*;
     use crate::input::*;
+
+    #[test]
+    fn bare_left_click_trigger_is_unsafe() {
+        let t = Trigger::MouseButton { button: MouseButton::Left, modifiers: vec![] };
+        assert!(!t.is_safe());
+        let t = Trigger::MouseButton { button: MouseButton::Right, modifiers: vec![] };
+        assert!(!t.is_safe());
+        let t = Trigger::MouseButton { button: MouseButton::Middle, modifiers: vec![] };
+        assert!(!t.is_safe());
+    }
+
+    #[test]
+    fn left_click_with_modifier_is_safe() {
+        let t = Trigger::MouseButton { button: MouseButton::Left, modifiers: vec![Modifier::Ctrl] };
+        assert!(t.is_safe());
+    }
+
+    #[test]
+    fn x_buttons_are_safe_bare() {
+        let t = Trigger::MouseButton { button: MouseButton::X1, modifiers: vec![] };
+        assert!(t.is_safe());
+        let t = Trigger::MouseButton { button: MouseButton::X2, modifiers: vec![] };
+        assert!(t.is_safe());
+    }
+
+    #[test]
+    fn hotkey_trigger_always_safe() {
+        let t = Trigger::Hotkey { key: KeyCode::F1, modifiers: vec![] };
+        assert!(t.is_safe());
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_trigger() {
+        let mut m = Macro::new(
+            "danger",
+            Trigger::MouseButton { button: MouseButton::Left, modifiers: vec![] },
+            PlaybackMode::Loop,
+        );
+        m.steps = vec![Step::Wait { min_ms: 10, max_ms: 10 }];
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("unsafe"), "error was: {err}");
+    }
 
     #[test]
     fn step_keypress_serde_roundtrip() {
