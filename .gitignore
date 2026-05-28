@@ -3,6 +3,7 @@
 Cargo.lock.bak
 .DS_Store
 .superpowers/
+.claude/
 crates/app/ui/node_modules/
 crates/app/ui/dist/
 crates/app/ui/.vite/
