@@ -114,7 +114,12 @@ pub enum StepDto {
     KeyDown { key: rm_macro_model::KeyCode },
     KeyUp { key: rm_macro_model::KeyCode },
     MouseClick { button: rm_macro_model::MouseButton, hold_ms: u32, at: Option<PointDto> },
-    MouseMove { to: PointDto, mode: MoveModeDto },
+    MouseMove {
+        to: PointDto,
+        mode: MoveModeDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
+    },
     MouseScroll { delta: i32 },
     Wait { min_ms: u32, max_ms: u32 },
 }
@@ -155,9 +160,10 @@ impl From<&rm_macro_model::Step> for StepDto {
                 hold_ms: *hold_ms,
                 at: at.as_ref().map(PointDto::from),
             },
-            Step::MouseMove { to, mode } => StepDto::MouseMove {
+            Step::MouseMove { to, mode, duration_ms } => StepDto::MouseMove {
                 to: PointDto::from(to),
                 mode: MoveModeDto::from(mode),
+                duration_ms: *duration_ms,
             },
             Step::MouseScroll { delta } => StepDto::MouseScroll { delta: *delta },
             Step::Wait { min_ms, max_ms } => StepDto::Wait { min_ms: *min_ms, max_ms: *max_ms },
@@ -177,9 +183,10 @@ impl From<StepDto> for rm_macro_model::Step {
                 hold_ms,
                 at: at.map(Into::into),
             },
-            StepDto::MouseMove { to, mode } => Step::MouseMove {
+            StepDto::MouseMove { to, mode, duration_ms } => Step::MouseMove {
                 to: to.into(),
                 mode: mode.into(),
+                duration_ms,
             },
             StepDto::MouseScroll { delta } => Step::MouseScroll { delta },
             StepDto::Wait { min_ms, max_ms } => Step::Wait { min_ms, max_ms },
@@ -333,6 +340,7 @@ mod tests {
         let s = StepDto::MouseMove {
             to: PointDto { x: 10, y: -5 },
             mode: MoveModeDto::Relative,
+            duration_ms: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: StepDto = serde_json::from_str(&json).unwrap();
@@ -355,6 +363,7 @@ mod tests {
             Step::MouseMove {
                 to: rm_macro_model::Point { x: 5, y: -3 },
                 mode: rm_macro_model::MoveMode::Relative,
+                duration_ms: None,
             },
             Step::MouseScroll { delta: 120 },
             Step::Wait { min_ms: 100, max_ms: 100 },

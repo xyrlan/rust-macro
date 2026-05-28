@@ -133,7 +133,7 @@ async fn run_step(hub: &DriverHub, step: &Step) -> Result<()> {
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
         }
-        Step::MouseMove { to, mode: _ } => {
+        Step::MouseMove { to, mode: _, duration_ms: _ } => {
             hub.send(RawEvent::MouseMove { dx: to.x, dy: to.y })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;

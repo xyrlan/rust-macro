@@ -114,6 +114,7 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
                 out.push(Step::MouseMove {
                     to: Point { x: total_dx, y: total_dy },
                     mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
                 });
                 // Advance past the entire run; last_at is the last consumed
                 // move so the next Wait reflects time-since-motion-ended.
@@ -257,7 +258,8 @@ mod tests {
             steps,
             vec![Step::MouseMove {
                 to: Point { x: 10, y: -5 },
-                mode: rm_macro_model::MoveMode::Relative
+                mode: rm_macro_model::MoveMode::Relative,
+                duration_ms: None,
             },]
         );
     }
@@ -320,6 +322,7 @@ mod tests {
             vec![Step::MouseMove {
                 to: Point { x: 17, y: 3 },
                 mode: rm_macro_model::MoveMode::Relative,
+                duration_ms: None,
             }]
         );
     }
@@ -343,6 +346,7 @@ mod tests {
                 Step::MouseMove {
                     to: Point { x: 8, y: 0 },
                     mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
                 },
                 Step::Wait { min_ms: 45, max_ms: 45 },
                 Step::KeyPress { key: KeyCode::A, hold_ms: 50 },
@@ -350,6 +354,7 @@ mod tests {
                 Step::MouseMove {
                     to: Point { x: -1, y: 5 },
                     mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
                 },
             ]
         );

@@ -25,6 +25,8 @@ pub enum Step {
     MouseMove {
         to: Point,
         mode: MoveMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
     },
     MouseScroll {
         delta: i32,
@@ -345,5 +347,43 @@ mod tests {
                 modifiers: vec![Modifier::Ctrl],
             }
         );
+    }
+
+    #[test]
+    fn mouse_move_legacy_json_deserializes_without_duration() {
+        let legacy = r#"{"type":"mouse_move","to":{"x":10,"y":5},"mode":"relative"}"#;
+        let s: Step = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            s,
+            Step::MouseMove {
+                to: Point { x: 10, y: 5 },
+                mode: MoveMode::Relative,
+                duration_ms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn mouse_move_with_duration_roundtrips() {
+        let s = Step::MouseMove {
+            to: Point { x: 100, y: -20 },
+            mode: MoveMode::Relative,
+            duration_ms: Some(50),
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"duration_ms\":50"), "json was: {j}");
+        let back: Step = serde_json::from_str(&j).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn mouse_move_none_duration_omits_field() {
+        let s = Step::MouseMove {
+            to: Point { x: 1, y: 2 },
+            mode: MoveMode::Relative,
+            duration_ms: None,
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(!j.contains("duration_ms"), "json was: {j}");
     }
 }
