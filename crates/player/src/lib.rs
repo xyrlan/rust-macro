@@ -93,7 +93,10 @@ async fn run(hub: Arc<DriverHub>, m: &Macro, mut stop_rx: oneshot::Receiver<()>)
                 debug!("player: stop signal");
                 return Ok(());
             }
-            run_step(&hub, step, &mut stop_rx).await?;
+            if run_step(&hub, step, &mut stop_rx).await? {
+                debug!("player: stop signal (from step)");
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -103,7 +106,7 @@ async fn run_step(
     hub: &DriverHub,
     step: &Step,
     stop_rx: &mut oneshot::Receiver<()>,
-) -> Result<()> {
+) -> Result<bool> {
     match step {
         Step::KeyPress { key, hold_ms } => {
             hub.send(RawEvent::KeyDown { key: *key })
@@ -147,7 +150,7 @@ async fn run_step(
                         .map_err(|e| AppError::DriverIo(e.to_string()))?;
                 }
                 (rm_macro_model::MoveMode::Relative, Some(dur)) => {
-                    stream_relative_move(hub, to.x, to.y, *dur, stop_rx).await?;
+                    return stream_relative_move(hub, to.x, to.y, *dur, stop_rx).await;
                 }
             }
         }
@@ -165,7 +168,7 @@ async fn run_step(
             tokio::time::sleep(Duration::from_millis(ms.into())).await;
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Stream a relative mouse move as a sequence of small chunks at 1ms intervals.
@@ -179,7 +182,7 @@ async fn stream_relative_move(
     total_dy: i32,
     duration_ms: u32,
     stop_rx: &mut oneshot::Receiver<()>,
-) -> Result<()> {
+) -> Result<bool> {
     let chunk_count = (duration_ms as i64).max(1);
     let tdx = total_dx as i64;
     let tdy = total_dy as i64;
@@ -188,7 +191,7 @@ async fn stream_relative_move(
 
     for i in 1..=chunk_count {
         if stop_rx.try_recv().is_ok() {
-            return Ok(());
+            return Ok(true);
         }
 
         let target_x = i * tdx / chunk_count;
@@ -206,7 +209,7 @@ async fn stream_relative_move(
 
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    Ok(())
+    Ok(false)
 }
 
 struct PlaybackIter {
@@ -457,6 +460,59 @@ mod tests {
         let sent = drv.drain_sent();
         let count = count_mouse_moves(&sent);
         assert!(count < 200, "stop should have cut the stream short, got {count} chunks");
+    }
+
+    #[tokio::test]
+    async fn stop_during_stream_halts_subsequent_steps() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+        let m = macro_with_steps(
+            vec![
+                Step::MouseMove {
+                    to: Point { x: 500, y: 0 },
+                    mode: MoveMode::Relative,
+                    duration_ms: Some(500),
+                },
+                // Sentinel step — must NOT execute if stop fires during the stream above.
+                Step::KeyPress { key: KeyCode::Z, hold_ms: 0 },
+            ],
+            PlaybackMode::Once,
+        );
+        let mut h = play(hub, m);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.stop();
+        h.wait().await.unwrap();
+        let sent = drv.drain_sent();
+        // The KeyPress would send KeyDown { key: Z } + KeyUp { key: Z }.
+        // Neither should appear if stop propagated correctly.
+        let z_events = sent.iter().filter(|e| matches!(
+            e,
+            RawEvent::KeyDown { key: rm_macro_model::KeyCode::Z }
+                | RawEvent::KeyUp { key: rm_macro_model::KeyCode::Z }
+        )).count();
+        assert_eq!(z_events, 0, "sentinel KeyPress ran after stop fired during stream");
+    }
+
+    #[tokio::test]
+    async fn loop_with_streaming_move_stops_cleanly() {
+        let drv = Arc::new(MockDriver::new());
+        let hub = DriverHub::start(drv.clone());
+        let m = macro_with_steps(
+            vec![Step::MouseMove {
+                to: Point { x: 100, y: 0 },
+                mode: MoveMode::Relative,
+                duration_ms: Some(200),
+            }],
+            PlaybackMode::Loop,
+        );
+        let mut h = play(hub, m);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.stop();
+        // wait() with a timeout — if stop is lost, the loop runs forever.
+        tokio::time::timeout(Duration::from_millis(500), h.wait())
+            .await
+            .expect("Loop did not stop within 500ms — stop signal was lost")
+            .unwrap();
     }
 
     #[tokio::test]
