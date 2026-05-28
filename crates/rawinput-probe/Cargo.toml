@@ -1,0 +1,11 @@
+[package]
+name = "rm-rawinput-probe"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rawinput-probe"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
