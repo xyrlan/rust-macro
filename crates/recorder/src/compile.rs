@@ -22,12 +22,13 @@ pub struct TimedEvent {
 ///     is the honest representation for overlapping inputs.
 ///   * Same rule for `MouseDown(b) → MouseUp(b)`.
 ///   * **Consecutive `MouseMove` events coalesce** into a single
-///     `Step::MouseMove { mode: Relative, to: sum(dx), sum(dy) }`. The kernel
-///     can deliver hundreds of MouseMove events per second; without this,
-///     a one-second drag would produce hundreds of steps. Coalescing breaks
-///     on any non-MouseMove event (key, click, wheel). The time consumed by
-///     the motion run is dropped on the floor — replay teleports to the
-///     destination instantly.
+///     `Step::MouseMove { mode: Relative, to: sum(dx), sum(dy), duration_ms }`.
+///     The kernel can deliver hundreds of MouseMove events per second; without
+///     this, a one-second drag would produce hundreds of steps. Coalescing
+///     breaks on any non-MouseMove event (key, click, wheel). `duration_ms`
+///     captures the timespan from the first to the last consumed move
+///     (collapsed to `None` when zero), so the player can stream the motion
+///     across that duration instead of teleporting to the destination.
 ///   * `MouseWheel` becomes `Step::MouseScroll`.
 ///   * Inter-event gaps become `Step::Wait { min_ms: gap, max_ms: gap }`.
 ///   * Lone / orphan key/mouse-up events emit a literal `Step::KeyUp` etc.
