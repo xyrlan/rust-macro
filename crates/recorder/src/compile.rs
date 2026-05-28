@@ -97,6 +97,7 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
                 // MouseDown when adjacent; orphans imply caller noise.)
             }
             RawEvent::MouseMove { dx, dy } => {
+                let first_at = cur.at;
                 // Coalesce this MouseMove and all immediately following
                 // MouseMoves into one step with summed deltas.
                 let mut total_dx: i32 = dx;
@@ -111,10 +112,11 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
                         break;
                     }
                 }
+                let dur = duration_ms_between(first_at, raw[j - 1].at);
                 out.push(Step::MouseMove {
                     to: Point { x: total_dx, y: total_dy },
                     mode: rm_macro_model::MoveMode::Relative,
-                    duration_ms: None,
+                    duration_ms: if dur > 0 { Some(dur) } else { None },
                 });
                 // Advance past the entire run; last_at is the last consumed
                 // move so the next Wait reflects time-since-motion-ended.
@@ -322,7 +324,7 @@ mod tests {
             vec![Step::MouseMove {
                 to: Point { x: 17, y: 3 },
                 mode: rm_macro_model::MoveMode::Relative,
-                duration_ms: None,
+                duration_ms: Some(12),
             }]
         );
     }
@@ -346,7 +348,7 @@ mod tests {
                 Step::MouseMove {
                     to: Point { x: 8, y: 0 },
                     mode: rm_macro_model::MoveMode::Relative,
-                    duration_ms: None,
+                    duration_ms: Some(5),
                 },
                 Step::Wait { min_ms: 45, max_ms: 45 },
                 Step::KeyPress { key: KeyCode::A, hold_ms: 50 },
@@ -354,7 +356,7 @@ mod tests {
                 Step::MouseMove {
                     to: Point { x: -1, y: 5 },
                     mode: rm_macro_model::MoveMode::Relative,
-                    duration_ms: None,
+                    duration_ms: Some(5),
                 },
             ]
         );
@@ -429,6 +431,59 @@ mod tests {
                 Step::Wait { min_ms: 30, max_ms: 30 },
                 Step::KeyPress { key: KeyCode::B, hold_ms: 50 },
             ]
+        );
+    }
+
+    #[test]
+    fn coalesced_moves_set_duration_ms() {
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::MouseMove { dx: 5, dy: 0 }),
+            ev(at(t0, 5), RawEvent::MouseMove { dx: 3, dy: 2 }),
+            ev(at(t0, 10), RawEvent::MouseMove { dx: 2, dy: -1 }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::MouseMove {
+                to: Point { x: 10, y: 1 },
+                mode: rm_macro_model::MoveMode::Relative,
+                duration_ms: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn single_move_has_no_duration() {
+        let t0 = Instant::now();
+        let raw = vec![ev(at(t0, 0), RawEvent::MouseMove { dx: 10, dy: -5 })];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::MouseMove {
+                to: Point { x: 10, y: -5 },
+                mode: rm_macro_model::MoveMode::Relative,
+                duration_ms: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn zero_duration_run_collapses_to_none() {
+        // Two moves at the same Instant — duration is 0, recorder collapses to None.
+        let t0 = Instant::now();
+        let raw = vec![
+            ev(at(t0, 0), RawEvent::MouseMove { dx: 1, dy: 0 }),
+            ev(at(t0, 0), RawEvent::MouseMove { dx: 1, dy: 0 }),
+        ];
+        let steps = compile_events(&raw);
+        assert_eq!(
+            steps,
+            vec![Step::MouseMove {
+                to: Point { x: 2, y: 0 },
+                mode: rm_macro_model::MoveMode::Relative,
+                duration_ms: None,
+            }]
         );
     }
 }
