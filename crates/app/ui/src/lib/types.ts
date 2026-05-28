@@ -87,7 +87,7 @@ export type StepDto =
   | { type: "key_down"; key: KeyCode }
   | { type: "key_up"; key: KeyCode }
   | { type: "mouse_click"; button: MouseButton; hold_ms: number; at: PointDto | null }
-  | { type: "mouse_move"; to: PointDto; mode: MoveModeDto }
+  | { type: "mouse_move"; to: PointDto; mode: MoveModeDto; duration_ms?: number }
   | { type: "mouse_scroll"; delta: number }
   | { type: "wait"; min_ms: number; max_ms: number };
 
