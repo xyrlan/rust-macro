@@ -69,10 +69,25 @@ pub fn play(hub: Arc<DriverHub>, macro_: Macro) -> PlaybackHandle {
     }
 }
 
+/// Minimum sleep injected between iterations of multi-iteration playback
+/// modes (Repeat, Loop, Toggle). Prevents a macro with no internal Wait from
+/// running at full async-runtime speed — which can saturate the OS input
+/// queue and make a Loop unrecoverable without killing the process.
+const MIN_ITERATION_GAP: Duration = Duration::from_millis(10);
+
 async fn run(hub: Arc<DriverHub>, m: &Macro, mut stop_rx: oneshot::Receiver<()>) -> Result<()> {
     debug!(macro_name = %m.name, mode = ?m.playback, "player: starting");
     let mut iter = playback_iter(m.playback);
+    let enforce_gap = matches!(
+        m.playback,
+        PlaybackMode::Repeat { .. } | PlaybackMode::Loop | PlaybackMode::Toggle
+    );
+    let mut first = true;
     while iter.next() {
+        if enforce_gap && !first {
+            tokio::time::sleep(MIN_ITERATION_GAP).await;
+        }
+        first = false;
         for step in &m.steps {
             if stop_rx.try_recv().is_ok() {
                 debug!("player: stop signal");
