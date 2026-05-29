@@ -183,11 +183,13 @@ async fn stream_relative_move(
     duration_ms: u32,
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> Result<bool> {
+    let start = std::time::Instant::now();
     let chunk_count = (duration_ms as i64).max(1);
     let tdx = total_dx as i64;
     let tdy = total_dy as i64;
     let mut sent_x: i64 = 0;
     let mut sent_y: i64 = 0;
+    let mut sends_emitted: u64 = 0;
 
     for i in 1..=chunk_count {
         if stop_rx.try_recv().is_ok() {
@@ -205,10 +207,21 @@ async fn stream_relative_move(
             hub.send(RawEvent::MouseMove { dx: chunk_dx, dy: chunk_dy })
                 .await
                 .map_err(|e| AppError::DriverIo(e.to_string()))?;
+            sends_emitted += 1;
         }
 
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        requested_ms = duration_ms,
+        actual_ms = elapsed_ms,
+        chunks = chunk_count,
+        sends = sends_emitted,
+        dx = total_dx,
+        dy = total_dy,
+        "stream_relative_move complete"
+    );
     Ok(false)
 }
 
