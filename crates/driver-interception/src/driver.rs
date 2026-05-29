@@ -2,6 +2,7 @@
 //! Interception's blocking `wait_with_timeout` to async via a dedicated OS
 //! thread + `tokio::sync::mpsc` channel.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +76,7 @@ impl InterceptionDriver {
     /// recorder MUST forward events back via `send()` (passthrough mode) to
     /// keep the OS responsive while recording is active.
     pub fn new() -> Result<Self, DriverError> {
-        Self::new_impl(true)
+        Self::new_impl(true, None)
     }
 
     /// Open an Interception context **without** installing capture filters,
@@ -87,10 +88,22 @@ impl InterceptionDriver {
     /// through our context, so keyboard and mouse remain fully usable during
     /// and after playback.
     pub fn new_send_only() -> Result<Self, DriverError> {
-        Self::new_impl(false)
+        Self::new_impl(false, None)
     }
 
-    fn new_impl(install_filters: bool) -> Result<Self, DriverError> {
+    /// Like `new()`, plus persistence: the pump loads cached
+    /// `ulExtraInformation` signatures from `signature_path` at startup and
+    /// writes back whenever a new signature is observed from hardware. This
+    /// primes the first-activation case where a macro fires before the user
+    /// has physically moved their mouse in the current session (relevant for
+    /// games whose anti-tamper bypasses Interception in-game — the pump never
+    /// observes hardware mouse events while the game is running, but the
+    /// signature from a previous session is still valid).
+    pub fn new_with_persisted_signatures(signature_path: PathBuf) -> Result<Self, DriverError> {
+        Self::new_impl(true, Some(signature_path))
+    }
+
+    fn new_impl(install_filters: bool, signature_path: Option<PathBuf>) -> Result<Self, DriverError> {
         let raw = Interception::new()
             .ok_or_else(|| DriverError::Unavailable("Interception::new() returned None".into()))?;
 
@@ -116,8 +129,14 @@ impl InterceptionDriver {
         let shutdown = Arc::new(AtomicBool::new(false));
         let last_keyboard_device = Arc::new(AtomicI32::new(1));
         let last_mouse_device = Arc::new(AtomicI32::new(11));
-        let last_keyboard_information = Arc::new(AtomicU32::new(0));
-        let last_mouse_information = Arc::new(AtomicU32::new(0));
+
+        // Load persisted signatures (if any). Failures fall back to 0.
+        let (init_kbd_info, init_mouse_info) = signature_path
+            .as_deref()
+            .and_then(load_signatures)
+            .unwrap_or((0, 0));
+        let last_keyboard_information = Arc::new(AtomicU32::new(init_kbd_info));
+        let last_mouse_information = Arc::new(AtomicU32::new(init_mouse_info));
 
         let thread_ctx = ctx.clone();
         let thread_shutdown = shutdown.clone();
@@ -131,6 +150,7 @@ impl InterceptionDriver {
                 thread_ctx, tx, thread_shutdown,
                 thread_last_kbd, thread_last_mouse,
                 thread_last_kbd_info, thread_last_mouse_info,
+                signature_path,
             ))
             .map_err(|e| DriverError::Io(format!("spawn pump thread: {e}")))?;
 
@@ -245,7 +265,13 @@ fn pump(
     last_mouse_device: Arc<AtomicI32>,
     last_keyboard_information: Arc<AtomicU32>,
     last_mouse_information: Arc<AtomicU32>,
+    signature_path: Option<PathBuf>,
 ) {
+    // Track signatures we've written so we only touch disk when they change.
+    // Initialized from whatever load_signatures returned (or 0/0).
+    let mut last_written_kbd_info = last_keyboard_information.load(Ordering::Relaxed);
+    let mut last_written_mouse_info = last_mouse_information.load(Ordering::Relaxed);
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -292,7 +318,41 @@ fn pump(
                 }
             }
         }
+
+        // Persist signatures when they change. Most events match the
+        // last-seen value, so this only writes once per signature-shift.
+        if let Some(path) = signature_path.as_deref() {
+            let cur_kbd = last_keyboard_information.load(Ordering::Relaxed);
+            let cur_mouse = last_mouse_information.load(Ordering::Relaxed);
+            if cur_kbd != last_written_kbd_info || cur_mouse != last_written_mouse_info {
+                if let Err(e) = save_signatures(path, cur_kbd, cur_mouse) {
+                    tracing::debug!(?e, "interception: save_signatures failed");
+                } else {
+                    last_written_kbd_info = cur_kbd;
+                    last_written_mouse_info = cur_mouse;
+                }
+            }
+        }
     }
+}
+
+/// Parse two whitespace-separated u32s (keyboard, mouse) from the file.
+/// Returns None on any failure — caller falls back to 0/0.
+fn load_signatures(path: &Path) -> Option<(u32, u32)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut parts = content.trim().split_whitespace();
+    let k: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    Some((k, m))
+}
+
+/// Write keyboard + mouse signatures to disk, atomic enough for our purposes
+/// (single fs::write call; failure is logged but not fatal).
+fn save_signatures(path: &Path, keyboard: u32, mouse: u32) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{} {}\n", keyboard, mouse))
 }
 
 fn convert_stroke(s: Stroke) -> crate::mouse::StrokeEvents {

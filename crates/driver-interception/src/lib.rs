@@ -23,6 +23,22 @@ pub fn open_with_status() -> Result<InterceptionDriver, AppError> {
     })
 }
 
+/// Like `open_with_status` but with persisted `ulExtraInformation` signatures
+/// at the given path. The pump loads cached signatures on startup and writes
+/// them back when new signatures are observed from hardware. Primes the
+/// first-activation case in games that bypass Interception in-play — the
+/// signature observed once (e.g., from desktop usage or a menu screen) is
+/// then available across app restarts.
+pub fn open_with_persisted_signatures(
+    signature_path: std::path::PathBuf,
+) -> Result<InterceptionDriver, AppError> {
+    InterceptionDriver::new_with_persisted_signatures(signature_path).map_err(|orig| match detect_status() {
+        DriverStatus::NotInstalled => AppError::DriverNotInstalled,
+        DriverStatus::InstalledNotRunning => AppError::DriverNotRunning,
+        DriverStatus::Running => AppError::DriverIo(orig.to_string()),
+    })
+}
+
 /// Open an Interception context without capture filters (send-only), mapping
 /// failure to `AppError` via `detect_status()`. Use for **playback** — the
 /// context can inject events via `send()` but does not steal user input from

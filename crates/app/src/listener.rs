@@ -47,9 +47,20 @@ pub fn start(
     registry: HotkeyRegistry,
     initial_stop_key: rm_macro_model::KeyCode,
 ) -> Result<ActiveListener, rm_error::AppError> {
-    let drv: Arc<dyn rm_driver::Driver> = Arc::new(
-        rm_driver_interception::open_with_status()?,
-    );
+    // Persist mouse/keyboard ulExtraInformation signatures across app
+    // restarts so the first macro fired in a new session (before any
+    // hardware mouse event reaches the Interception pump) can still
+    // carry the user's real signature. This matters in games whose
+    // anti-tamper bypasses Interception while running — the pump never
+    // observes physical mouse events in-game, so a cold start would
+    // otherwise inject with signature=0 and get filtered out.
+    let signature_path = app
+        .try_state::<AppState>()
+        .map(|s| s.storage_root.join(".input-signatures"));
+    let drv: Arc<dyn rm_driver::Driver> = Arc::new(match signature_path {
+        Some(path) => rm_driver_interception::open_with_persisted_signatures(path)?,
+        None => rm_driver_interception::open_with_status()?,
+    });
     let hub = DriverHub::start(drv);
 
     let suppress_key: Arc<std::sync::Mutex<Option<rm_macro_model::KeyCode>>> =
