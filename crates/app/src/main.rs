@@ -24,6 +24,17 @@ fn read_pending_reboot(storage_root: &std::path::Path) -> bool {
 }
 
 fn main() {
+    // Raise this process's timer resolution to 1ms so tokio::time::sleep
+    // honors sub-15ms durations. Windows default is ~15.6ms (system tick) —
+    // without this, the mouse-stream playback (1ms-cadence chunks) silently
+    // runs ~15x slower than intended, distorting recorded motion in-game.
+    // Per-process timer resolution is automatically released on process exit
+    // (Windows 10+), so no timeEndPeriod call is needed.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
