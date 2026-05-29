@@ -21,14 +21,13 @@ pub struct TimedEvent {
 ///     happens between, the events are kept as raw `KeyDown` / `KeyUp` — this
 ///     is the honest representation for overlapping inputs.
 ///   * Same rule for `MouseDown(b) → MouseUp(b)`.
-///   * **Consecutive `MouseMove` events coalesce** into a single
-///     `Step::MouseMove { mode: Relative, to: sum(dx), sum(dy), duration_ms }`.
-///     The kernel can deliver hundreds of MouseMove events per second; without
-///     this, a one-second drag would produce hundreds of steps. Coalescing
-///     breaks on any non-MouseMove event (key, click, wheel). `duration_ms`
-///     captures the timespan from the first to the last consumed move
-///     (collapsed to `None` when zero), so the player can stream the motion
-///     across that duration instead of teleporting to the destination.
+///   * **Each `MouseMove` becomes its own `Step::MouseMove { to: dx,dy,
+///     duration_ms }`**, with `duration_ms` set to the interval until the
+///     next event (any kind), capped at 100ms. We DO NOT coalesce consecutive
+///     moves — a coalesced sum replays as a straight line, losing the curve
+///     the user actually traced. Storage grows ~N× where N is the HID poll
+///     rate of the mouse (typically 1000Hz for gaming mice), but the
+///     trajectory is preserved exactly.
 ///   * `MouseWheel` becomes `Step::MouseScroll`.
 ///   * Inter-event gaps become `Step::Wait { min_ms: gap, max_ms: gap }`.
 ///   * Lone / orphan key/mouse-up events emit a literal `Step::KeyUp` etc.
@@ -98,32 +97,28 @@ pub fn compile_events(raw: &[TimedEvent]) -> Vec<Step> {
                 // MouseDown when adjacent; orphans imply caller noise.)
             }
             RawEvent::MouseMove { dx, dy } => {
-                let first_at = cur.at;
-                // Coalesce this MouseMove and all immediately following
-                // MouseMoves into one step with summed deltas.
-                let mut total_dx: i32 = dx;
-                let mut total_dy: i32 = dy;
-                let mut j = i + 1;
-                while let Some(next) = raw.get(j) {
-                    if let RawEvent::MouseMove { dx: ndx, dy: ndy } = next.event {
-                        total_dx = total_dx.saturating_add(ndx);
-                        total_dy = total_dy.saturating_add(ndy);
-                        j += 1;
-                    } else {
-                        break;
+                // No coalescing: each HID poll's delta becomes its own Step
+                // so playback follows the recorded trajectory exactly. A
+                // coalesced sum replays as a straight line from start to
+                // end, losing the curve the user actually drew.
+                //
+                // duration_ms = interval to the next MouseMove only (so the
+                // player paces the trajectory at original cadence). If the
+                // next event is non-MouseMove, duration_ms is None — the
+                // motion ends here and the gap becomes a Wait step instead
+                // (the existing Wait insertion logic handles it; using
+                // duration_ms here would double-count the gap).
+                let dur = match raw.get(i + 1) {
+                    Some(next) if matches!(next.event, RawEvent::MouseMove { .. }) => {
+                        duration_ms_between(cur.at, next.at).min(100)
                     }
-                }
-                let dur = duration_ms_between(first_at, raw[j - 1].at);
+                    _ => 0,
+                };
                 out.push(Step::MouseMove {
-                    to: Point { x: total_dx, y: total_dy },
+                    to: Point { x: dx, y: dy },
                     mode: rm_macro_model::MoveMode::Relative,
                     duration_ms: if dur > 0 { Some(dur) } else { None },
                 });
-                // Advance past the entire run; last_at is the last consumed
-                // move so the next Wait reflects time-since-motion-ended.
-                last_at = raw[j - 1].at;
-                i = j;
-                continue;
             }
             RawEvent::MouseWheel { delta } => {
                 out.push(Step::MouseScroll { delta });
@@ -311,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_mouse_moves_coalesce_summing_deltas() {
+    fn consecutive_mouse_moves_emit_one_step_per_event() {
         let t0 = Instant::now();
         let raw = vec![
             ev(at(t0, 0), RawEvent::MouseMove { dx: 5, dy: 0 }),
@@ -322,17 +317,36 @@ mod tests {
         let steps = compile_events(&raw);
         assert_eq!(
             steps,
-            vec![Step::MouseMove {
-                to: Point { x: 17, y: 3 },
-                mode: rm_macro_model::MoveMode::Relative,
-                duration_ms: Some(12),
-            }]
+            vec![
+                Step::MouseMove {
+                    to: Point { x: 5, y: 0 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: Some(4),
+                },
+                Step::MouseMove {
+                    to: Point { x: 3, y: 2 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: Some(4),
+                },
+                Step::MouseMove {
+                    to: Point { x: -1, y: 4 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: Some(4),
+                },
+                Step::MouseMove {
+                    to: Point { x: 10, y: -3 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
+                },
+            ]
         );
     }
 
     #[test]
-    fn mouse_move_runs_break_on_non_move_event() {
-        // Move, Move, KeyDown, Move → two coalesced runs with the key between.
+    fn mouse_move_followed_by_non_move_uses_none_duration() {
+        // Move, Move, KeyDown, Move → each move is its own Step; the move
+        // immediately before a non-MouseMove event has duration_ms=None so
+        // the inter-event gap becomes a Wait without double-counting.
         let t0 = Instant::now();
         let raw = vec![
             ev(at(t0, 0), RawEvent::MouseMove { dx: 5, dy: 0 }),
@@ -347,17 +361,27 @@ mod tests {
             steps,
             vec![
                 Step::MouseMove {
-                    to: Point { x: 8, y: 0 },
+                    to: Point { x: 5, y: 0 },
                     mode: rm_macro_model::MoveMode::Relative,
                     duration_ms: Some(5),
+                },
+                Step::MouseMove {
+                    to: Point { x: 3, y: 0 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
                 },
                 Step::Wait { min_ms: 45, max_ms: 45 },
                 Step::KeyPress { key: KeyCode::A, hold_ms: 50 },
                 Step::Wait { min_ms: 100, max_ms: 100 },
                 Step::MouseMove {
-                    to: Point { x: -1, y: 5 },
+                    to: Point { x: -2, y: 4 },
                     mode: rm_macro_model::MoveMode::Relative,
                     duration_ms: Some(5),
+                },
+                Step::MouseMove {
+                    to: Point { x: 1, y: 1 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
                 },
             ]
         );
@@ -436,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_moves_set_duration_ms() {
+    fn mouse_move_duration_is_interval_to_next_move() {
         let t0 = Instant::now();
         let raw = vec![
             ev(at(t0, 0), RawEvent::MouseMove { dx: 5, dy: 0 }),
@@ -446,11 +470,23 @@ mod tests {
         let steps = compile_events(&raw);
         assert_eq!(
             steps,
-            vec![Step::MouseMove {
-                to: Point { x: 10, y: 1 },
-                mode: rm_macro_model::MoveMode::Relative,
-                duration_ms: Some(10),
-            }]
+            vec![
+                Step::MouseMove {
+                    to: Point { x: 5, y: 0 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: Some(5),
+                },
+                Step::MouseMove {
+                    to: Point { x: 3, y: 2 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: Some(5),
+                },
+                Step::MouseMove {
+                    to: Point { x: 2, y: -1 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
+                },
+            ]
         );
     }
 
@@ -470,8 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_duration_run_collapses_to_none() {
-        // Two moves at the same Instant — duration is 0, recorder collapses to None.
+    fn same_instant_moves_both_get_none_duration() {
+        // Two moves at the same Instant — duration_ms_between is 0, so both
+        // collapse to duration_ms=None (the chunked stream path is skipped).
         let t0 = Instant::now();
         let raw = vec![
             ev(at(t0, 0), RawEvent::MouseMove { dx: 1, dy: 0 }),
@@ -480,11 +517,18 @@ mod tests {
         let steps = compile_events(&raw);
         assert_eq!(
             steps,
-            vec![Step::MouseMove {
-                to: Point { x: 2, y: 0 },
-                mode: rm_macro_model::MoveMode::Relative,
-                duration_ms: None,
-            }]
+            vec![
+                Step::MouseMove {
+                    to: Point { x: 1, y: 0 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
+                },
+                Step::MouseMove {
+                    to: Point { x: 1, y: 0 },
+                    mode: rm_macro_model::MoveMode::Relative,
+                    duration_ms: None,
+                },
+            ]
         );
     }
 }
