@@ -184,6 +184,7 @@ async fn stream_relative_move(
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> Result<bool> {
     let start = std::time::Instant::now();
+    let total = Duration::from_millis(duration_ms as u64);
     let chunk_count = (duration_ms as i64).max(1);
     let tdx = total_dx as i64;
     let tdy = total_dy as i64;
@@ -210,7 +211,17 @@ async fn stream_relative_move(
             sends_emitted += 1;
         }
 
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        // Deadline-based scheduling: target the i-th chunk's emit to land at
+        // start + i * total / chunk_count. If individual tokio sleeps are
+        // imprecise (Windows debug builds see ~2.3ms minimum sleep), drift
+        // doesn't compound — we sleep until the absolute target, and skip
+        // entirely when behind, racing to catch up.
+        let target_elapsed = total * (i as u32) / (chunk_count as u32);
+        let target_instant = start + target_elapsed;
+        let now = std::time::Instant::now();
+        if let Some(remaining) = target_instant.checked_duration_since(now) {
+            tokio::time::sleep(remaining).await;
+        }
     }
     let elapsed_ms = start.elapsed().as_millis() as u64;
     tracing::info!(
